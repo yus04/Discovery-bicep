@@ -24,6 +24,15 @@
 | 14 | `discoveryStorageContainer` | `Microsoft.Discovery/storageContainers` | 2026-06-01 | Discovery のストレージコンテナー。`storageAccount` を Blob ストアとして参照。 |
 | 15 | `project` | `Microsoft.Discovery/workspaces/projects` | 2026-06-01 | Workspace 配下の Project。`discoveryStorageContainer` を参照。 |
 | 16 | `discoveryControlPlaneRoles` | `Microsoft.Resources/deployments` (module) | — | サブスクリプション スコープ モジュール呼び出し。[subscription-roles.bicep](subscription-roles.bicep) を実行。Quickstart には無い独自拡張。 |
+| 17 | `knowledgeBlobContainer` | `Microsoft.Storage/storageAccounts/blobServices/containers` | 2023-05-01 | Knowledge Base にインデックスする元資料用 Blob コンテナー (`knowledgedocuments`)。`deployBookshelf=true` のときのみ作成。独自拡張。 |
+| 18 | `bookshelfIdentity` | `Microsoft.ManagedIdentity/userAssignedIdentities` | 2024-11-30 | Bookshelf のワークロード ID。Knowledge Base が Blob を読むために使用。独自拡張。 |
+| 19 | `bookshelfStorageBlobDataContributorAssignment` | `Microsoft.Authorization/roleAssignments` | 2022-04-01 | `bookshelfIdentity` へ Storage Blob Data Contributor (スコープ: storageAccount)。独自拡張。 |
+| 20 | `bookshelf` | `Microsoft.Discovery/bookshelves` | 2026-06-01 | Knowledge Base のホスト。`privateEndpointSubnet` と `bookshelfSearchSubnet` を参照。`indexSize` タグは `deploymentMode` プリセット (CostOptimized: `small` / Production: `medium`)。作成すると `mrg-dbksf-*` に Azure SQL / AI Search / Container Apps / Storage が自動生成される。独自拡張。 |
+| 21 | `knowledgeStorageContainer` | `Microsoft.Discovery/storageContainers` | 2026-06-01 | Knowledge 用の Discovery ストレージコンテナー。出力用とは別に作成。独自拡張。 |
+| 22 | `knowledgeStorageAsset` | `Microsoft.Discovery/storageContainers/storageAssets` | 2026-06-01 | Knowledge Base 作成ウィザードで選択するデータパス定義。`knowledgeStorageContainer` の子。独自拡張。 |
+| 23 | `discoveryTools` | `Microsoft.Discovery/tools` | 2026-06-01 | Agent 作成画面の **Tools** 欄に並ぶツール定義。`tools` パラメーターの配列分ループ。省略時はサンプル `dataset-summary` を 1 件作成。独自拡張。 |
+
+※ #17〜#22 は `deployBookshelf` (既定 `true`)、#23 は `deployTools` (既定 `true`) で作成の有無を切り替えられます。
 
 ### サブスクリプション スコープ (subscription-roles.bicep)
 
@@ -45,14 +54,17 @@ Discovery の第1パーティ サービスプリンシパル (Discovery control-
 | `privateEndpointSubnet` | 10.0.4.0/24 | なし | なし | `workspace` (Private Endpoint) |
 | `agentSubnet` | 10.0.5.0/24 | `Microsoft.App/environments` | `Microsoft.Storage` | `workspace` (Agent) |
 | `searchSubnet` | 10.0.6.0/24 | `Microsoft.App/environments` | `Microsoft.Storage` | (予約: Search 用) |
+| `bookshelfSearchSubnet` | 10.0.7.0/24 | なし | `Microsoft.Storage` | `bookshelf` (マネージド AI Search) |
+
+> ⚠️ `bookshelfSearchSubnet` は **意図的に未委任** です。Bookshelf のマネージド AI Search は `Microsoft.App/environments` に委任されたサブネットに参加できないため、既存の `searchSubnet` とは別に用意しています。また公式仕様上、検索サブネットとプライベートエンドポイントサブネットは別である必要があります。
 
 ### コストモード (`deploymentMode`) とタグ
 
-`deploymentMode` (`CostOptimized` 既定 / `Production`) がコスト関連パラメーターを一括で切り替えます。対象は ノードプール (VM サイズ / 最大・最小ノード数 / 優先度 / OS ディスク)、スパコンのシステムノードプール SKU、ストレージの冗長性とアクセス層です。個別パラメーターを明示指定した場合はそちらが優先されます。詳細は [README 1-1](README.md#1-1-コストモードdeploymentmode) を参照。
+`deploymentMode` (`CostOptimized` 既定 / `Production`) がコスト関連パラメーターを一括で切り替えます。対象は ノードプール (VM サイズ / 最大・最小ノード数 / 優先度 / OS ディスク)、スパコンのシステムノードプール SKU、ストレージの冗長性とアクセス層、**Bookshelf の `indexSize`**、**ツールに注入される `DISCOVERY_MAX_PARALLELISM`** です。個別パラメーターを明示指定した場合はそちらが優先されます。詳細は [README 1-1](README.md#1-1-コストモードdeploymentmode) を参照。
 
-タグを持てるすべてのリソース (VNet / UAMI / ストレージアカウント / Discovery 各リソース) には `SecurityControl: Ignore` が付与されます。ロール割り当てと Blob サービス / コンテナーは ARM 上タグを持てないため対象外です。
+タグを持てるすべてのリソース (VNet / UAMI / ストレージアカウント / Discovery 各リソース / Bookshelf / Tools) には `SecurityControl: Ignore` が付与されます。Bookshelf には加えて `indexSize` タグが付きます。ロール割り当てと Blob サービス / コンテナーは ARM 上タグを持てないため対象外です。
 
-`CostOptimized` の場合、Discovery が自動生成するマネージドリソースグループ (`mrg-dwsp-*` / `mrg-dscmp-*`) 内の AKS / Container Apps / Cosmos DB / Log Analytics / ストレージについては、Bicep では制御できないためデプロイ後に `optimize-mrg.sh` (`optimize-mrg.ps1`) がベストエフォートで設定変更します。変更項目の一覧は [README 1-1](README.md#1-1-コストモードdeploymentmode) の表を参照。
+`CostOptimized` の場合、Discovery が自動生成するマネージドリソースグループ (`mrg-dwsp-*` / `mrg-dscmp-*` / `mrg-dbksf-*`) 内の AKS / Container Apps / Cosmos DB / Log Analytics / ストレージ / **Azure SQL** / **AI Search** については、Bicep では制御できないためデプロイ後に `optimize-mrg.sh` (`optimize-mrg.ps1`) がベストエフォートで設定変更します。変更項目の一覧は [README 1-1](README.md#1-1-コストモードdeploymentmode) の表を参照。
 
 ## リソース関連図 (Mermaid)
 
@@ -79,13 +91,16 @@ flowchart LR
       SN4["privateEndpointSubnet"]
       SN5["agentSubnet<br/>(delegated: Microsoft.App/environments)"]
       SN6["searchSubnet<br/>(delegated: Microsoft.App/environments)"]
+      SN7["bookshelfSearchSubnet<br/>(undelegated)"]
     end
 
     UAMI["managedIdentity<br/>(User-Assigned Managed Identity)"]
+    BKSUAMI["bookshelfIdentity<br/>(Bookshelf ワークロード ID)"]
 
     subgraph STG["storageAccount (Microsoft.Storage/storageAccounts)"]
       BLOBSVC["blobServices (default)"]
       BLOBCNT["blobContainer<br/>(discoveryoutputs)"]
+      KBLOBCNT["knowledgeBlobContainer<br/>(knowledgedocuments)"]
     end
 
     subgraph DISC["Microsoft.Discovery resources"]
@@ -95,12 +110,17 @@ flowchart LR
       CMD["chatModelDeployment"]
       DSC["discoveryStorageContainer"]
       PRJ["project"]
+      BKS["bookshelf"]
+      KSC["knowledgeStorageContainer"]
+      KSA["knowledgeStorageAsset"]
+      TOOLS["discoveryTools<br/>(Microsoft.Discovery/tools)"]
     end
 
     RA1["roleAssignment:<br/>Storage Blob Data Contributor<br/>(scope: storageAccount)"]
     RA2["roleAssignment:<br/>Discovery Platform Contributor<br/>(scope: resourceGroup)"]
     RA3["roleAssignment:<br/>AcrPull<br/>(scope: resourceGroup)"]
     RA4["discoveryStudioAdminAssignments<br/>Discovery Platform Administrator<br/>(scope: resourceGroup)"]
+    RA5["roleAssignment:<br/>Storage Blob Data Contributor<br/>(bookshelfIdentity / scope: storageAccount)"]
     ADMINS(["workspaceAdminPrincipalIds<br/>(Entra users / groups)"])
 
     MOD["discoveryControlPlaneRoles<br/>(module → subscription scope)"]
@@ -111,11 +131,29 @@ flowchart LR
 
   %% Storage hierarchy
   BLOBSVC --> BLOBCNT
+  BLOBSVC --> KBLOBCNT
 
   %% Discovery hierarchy
   SC --> NP
   WS --> CMD
   WS --> PRJ
+  KSC --> KSA
+
+  %% Bookshelf / Knowledge wiring
+  SN4 -.privateEndpointSubnetId.-> BKS
+  SN7 -.searchSubnetId.-> BKS
+  BKSUAMI -.workloadIdentities.-> BKS
+  BKSUAMI --> RA5
+  RA5 -.scope.-> STG
+  KSC -.storageAccountId.-> STG
+  KSA -.path.-> KBLOBCNT
+  BKS -.ホストする.-> KB(["Knowledge Base<br/>(Discovery Studio で作成)"])
+  KSA -.ウィザードで選択.-> KB
+  BKSUAMI -.ウィザードで選択.-> KB
+
+  %% Tools
+  TOOLS -.Studio の Agent 作成画面で選択.-> AGENT(["Agent<br/>(Discovery Studio で作成)"])
+  KB -.Knowledge Bases 欄で選択.-> AGENT
 
   %% Subnet usage
   SN2 -.uses.-> SC
@@ -164,7 +202,10 @@ flowchart LR
 - **Discovery Studio 管理者ロール (リソースグループ内 / 独自拡張)**: `workspaceAdminPrincipalIds` に渡した Entra Object ID へ Discovery Platform Administrator をリソースグループスコープで付与。これがないと Discovery Studio 上で「Access denied」となり Agent / Project が作成できない。
 - **Discovery スタック**: `supercomputer` → `nodePool` (親子)、`workspace` → `chatModelDeployment` / `project` (親子)、`workspace` は `supercomputer.id` を参照し、`project` は `chatModelDeployment` に `dependsOn`。
 - **Discovery 第1パーティ SP へのロール割り当て (サブスクリプション スコープ)**: `discoveryControlPlaneRoles` モジュールが Discovery control-plane service App にカスタムロール「Discovery NSP Perimeter Joiner FDPO」と組み込み Reader をサブスクリプション スコープで付与。`supercomputer` / `workspace` / `discoveryStorageContainer` はこのモジュールに `dependsOn` し、Discovery コントロールプレーンが NSP を構成する前に必要な権限が伝播することを保証する。
-- **必要なデプロイ権限**: 上記モジュールはサブスクリプション スコープでカスタムロール作成 + ロール割り当てを行うため、デプロイ実行者は **Subscription 上の Owner または User Access Administrator** 権限を持つ必要がある。第1パーティ SP がテナントに存在しない場合、`deploy.ps1` が `az ad sp create` で作成するため **Application Administrator** (Entra ID) も要求される場合がある。
+- **必要なデプロイ権限**: 上記モジュールはサブスクリプション スコープでカスタムロール作成 + ロール割り当てを行うため、デプロイ実行者は **Subscription 上の Owner または User Access Administrator** 権限を持つ必要がある。第1パーティ SP がテナントに存在しない場合、`deploy.ps1` / `deploy.sh` が `az ad sp create` で作成するため **Application Administrator** (Entra ID) も要求される場合がある。
+- **Bookshelf スタック (独自拡張)**: `bookshelf` は `privateEndpointSubnet` と `bookshelfSearchSubnet` を参照し、`bookshelfIdentity` を `workloadIdentities` に登録する。`bookshelfIdentity` には `storageAccount` スコープで Storage Blob Data Contributor を付与し、Knowledge Base のインデックス時に `knowledgeBlobContainer` を読めるようにする。`knowledgeStorageContainer` → `knowledgeStorageAsset` の親子関係で、Studio の Knowledge Base 作成ウィザードが参照する。
+- **Knowledge Base 本体は ARM 外**: `Microsoft.Discovery/bookshelves` までが ARM の管轄で、Knowledge Base の作成と Index 実行は Discovery Studio (データプレーン) で行う。本テンプレートはウィザードで選択する前提リソースをすべて揃える。
+- **Discovery ツール (独自拡張)**: `discoveryTools` は他の Discovery リソースとの親子関係を持たない独立した RG スコープリソースで、Discovery Studio の Agent 作成画面から選択される。全ツールに `DISCOVERY_DEPLOYMENT_MODE` / `DISCOVERY_NODE_POOL_NAME` / `DISCOVERY_STORAGE_CONTAINER_NAME` / `DISCOVERY_MAX_PARALLELISM` が環境変数として注入される。ツール定義自体にランニングコストはない。
 
 ## 参考ドキュメント
 

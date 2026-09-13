@@ -59,6 +59,10 @@ $TargetLawRetentionDays = 30                # Log Analytics 保持期間 (最短
 $TargetLawDailyQuotaGb  = 1                 # Log Analytics 日次取り込み上限
 $TargetStorageSku       = 'Standard_LRS'    # ストレージ冗長性
 $TargetStorageTier      = 'Cool'            # ストレージアクセス層
+$TargetSqlObjective     = 'GP_S_Gen5_2'     # Azure SQL: 汎用サーバーレス 2 vCore
+$TargetSqlAutoPauseMin  = 60                # Azure SQL: 自動一時停止までのアイドル分数
+$TargetSearchReplicas   = 1                 # AI Search: レプリカ数
+$TargetSearchPartitions = 1                 # AI Search: パーティション数
 
 # 集計用
 $script:OkCount     = 0
@@ -453,10 +457,78 @@ foreach ($rg in $mrgs) {
 }
 
 # ------------------------------------------------------------------
-# 9. 対象外リソースの明示
+# 9. Azure SQL Database (Bookshelf の Knowledge Base グラフ保存先)
+#    Bookshelf は既定で Hyperscale / ゾーン冗長の DB を作るため、アイドル時でも
+#    固定費が大きい。汎用サーバーレス + 自動一時停止へ寄せてアイドル課金を止める。
+#    ※ Hyperscale からのエディション変更は拒否されることがあるためベストエフォート。
+# ------------------------------------------------------------------
+Write-Head 'Azure SQL Database (Bookshelf)'
+foreach ($rg in $mrgs) {
+    $servers = Get-AzJson @('sql', 'server', 'list', '-g', $rg, '-o', 'json')
+    foreach ($srv in @($servers)) {
+        $dbs = Get-AzJson @('sql', 'db', 'list', '-g', $rg, '-s', $srv.name, '-o', 'json')
+        foreach ($db in @($dbs)) {
+            if ($db.name -eq 'master') { continue }
+            $objective = $db.currentServiceObjectiveName
+            Write-Sub "$rg / $($srv.name) / $($db.name) ($objective)"
+
+            if ($objective -eq $TargetSqlObjective) {
+                Write-Skip "DB $($db.name): 既に $TargetSqlObjective"
+            } else {
+                Invoke-Change "DB $($db.name): $objective -> $TargetSqlObjective (サーバーレス + 自動一時停止 $TargetSqlAutoPauseMin 分)" `
+                    @('sql', 'db', 'update', '-g', $rg, '-s', $srv.name, '-n', $db.name,
+                      '--edition', 'GeneralPurpose', '--family', 'Gen5', '--capacity', '2',
+                      '--compute-model', 'Serverless', '--auto-pause-delay', "$TargetSqlAutoPauseMin", '-o', 'none')
+            }
+
+            if ($db.zoneRedundant) {
+                Invoke-Change "DB $($db.name): ゾーン冗長を無効化" `
+                    @('sql', 'db', 'update', '-g', $rg, '-s', $srv.name, '-n', $db.name, '--zone-redundant', 'false', '-o', 'none')
+            } else {
+                Write-Skip "DB $($db.name): ゾーン冗長は無効"
+            }
+        }
+    }
+}
+
+# ------------------------------------------------------------------
+# 10. Azure AI Search (Bookshelf の Knowledge Base 検索)
+#     Bookshelf は既定で Standard S1 x 2 レプリカ (可用性ゾーン対応) を作る。
+#     検証用途ではレプリカ 1 で十分なため、半額化する。
+#     ※ SKU (S1 など) は作成時のみ指定可能で、後から変更できません。
+# ------------------------------------------------------------------
+Write-Head 'Azure AI Search (Bookshelf)'
+Write-Host '   ※ SKU は作成時固定のため変更できません。レプリカ / パーティション数のみ調整します。'
+foreach ($rg in $mrgs) {
+    $services = Get-AzJson @('search', 'service', 'list', '-g', $rg, '-o', 'json')
+    foreach ($svc in @($services)) {
+        Write-Sub "$rg / $($svc.name) ($($svc.sku.name) / replicas=$($svc.replicaCount) / partitions=$($svc.partitionCount))"
+
+        $updateArgs = @()
+        $descParts = @()
+        if ($svc.replicaCount -ne $TargetSearchReplicas) {
+            $updateArgs += @('--replica-count', "$TargetSearchReplicas")
+            $descParts += "レプリカ $($svc.replicaCount) -> $TargetSearchReplicas"
+        }
+        if ($svc.partitionCount -ne $TargetSearchPartitions) {
+            $updateArgs += @('--partition-count', "$TargetSearchPartitions")
+            $descParts += "パーティション $($svc.partitionCount) -> $TargetSearchPartitions"
+        }
+
+        if ($updateArgs.Count -eq 0) {
+            Write-Skip "$($svc.name): 既に最小構成"
+        } else {
+            Invoke-Change "$($svc.name): $($descParts -join ', ')" `
+                (@('search', 'service', 'update', '-g', $rg, '-n', $svc.name) + $updateArgs + @('-o', 'none'))
+        }
+    }
+}
+
+# ------------------------------------------------------------------
+# 11. 対象外リソースの明示
 # ------------------------------------------------------------------
 Write-Head '対象外 (意図的に変更しないもの)'
-Write-Host '   * Azure AI Search        : Basic プランのまま維持します。'
+Write-Host '   * AI Search の SKU      : 作成時固定のため変更できません (レプリカ数のみ調整)。'
 Write-Host '   * Private Endpoint       : 削除すると Discovery が動作しなくなるため触りません。'
 Write-Host '   * Private DNS ゾーン     : 同上。'
 Write-Host '   * NSP (ネットワーク境界) : 同上。'
@@ -465,9 +537,12 @@ Write-Host ''
 Write-Host '   💡 Private Endpoint は 1 本あたり月数ドルの固定費が発生します。'
 Write-Host '      本数を減らしたい場合は main.bicep の networkIsolation=false で'
 Write-Host '      ワークスペースを作り直してください (本スクリプトでは変更できません)。'
+Write-Host ''
+Write-Host '   💡 Bookshelf を使わない期間は deploy 時に -SkipBookshelf を指定するか、'
+Write-Host '      Bookshelf リソースごと削除するのが最も確実なコスト削減です。'
 
 # ------------------------------------------------------------------
-# 10. サマリー
+# 12. サマリー
 # ------------------------------------------------------------------
 Write-Head 'サマリー'
 if ($Apply) {

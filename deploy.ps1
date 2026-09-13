@@ -25,6 +25,18 @@
 .EXAMPLE
     ./deploy.ps1 -SkipMrgOptimize
     デプロイ後のマネージドリソースグループ最適化をスキップ
+
+.EXAMPLE
+    ./deploy.ps1 -SkipBookshelf
+    Bookshelf と Knowledge 用ストレージを作らずにデプロイ (Knowledge 機能は使えません)
+
+.EXAMPLE
+    ./deploy.ps1 -SkipTools
+    Microsoft.Discovery/tools を作らずにデプロイ
+
+.EXAMPLE
+    ./deploy.ps1 -BookshelfIndexSize medium
+    Bookshelf の indexSize をモード既定から明示的に上書き
 #>
 [CmdletBinding()]
 param(
@@ -50,13 +62,25 @@ param(
     [string]$DeploymentMode = $(if ($env:DEPLOYMENT_MODE) { $env:DEPLOYMENT_MODE } else { 'CostOptimized' }),
 
     # 指定すると、コスト最適化モードでもデプロイ後の MRG 最適化を実行しない
-    [switch]$SkipMrgOptimize
+    [switch]$SkipMrgOptimize,
+
+    # 指定すると Bookshelf / Knowledge 用ストレージ / Discovery ツールを作らない
+    [switch]$SkipBookshelf,
+
+    [switch]$SkipTools,
+
+    # 空文字のときは deploymentMode のプリセット (CostOptimized: small / Production: medium)
+    [ValidateSet('', 'small', 'medium', 'large')]
+    [string]$BookshelfIndexSize = $(if ($env:BOOKSHELF_INDEX_SIZE) { $env:BOOKSHELF_INDEX_SIZE } else { '' })
 )
 
 $ErrorActionPreference = 'Stop'
 
 # az CLI のテレメトリ収集を無効化 (環境によってはクラッシュ回避のため必須)
 $env:AZURE_CORE_COLLECT_TELEMETRY = '0'
+
+$deployBookshelf = (-not $SkipBookshelf).ToString().ToLowerInvariant()
+$deployTools     = (-not $SkipTools).ToString().ToLowerInvariant()
 
 Write-Host '=================================================='
 Write-Host ' Microsoft Discovery デプロイ'
@@ -65,6 +89,8 @@ Write-Host "   リソースグループ  : $ResourceGroup"
 Write-Host "   デプロイ名        : $DeploymentName"
 Write-Host "   テンプレート      : $TemplateFile"
 Write-Host "   コストモード      : $DeploymentMode"
+Write-Host "   Bookshelf         : $deployBookshelf (indexSize: $(if ($BookshelfIndexSize) { $BookshelfIndexSize } else { 'モード既定' }))"
+Write-Host "   Discovery ツール  : $deployTools"
 Write-Host '=================================================='
 
 # ------------------------------------------------------------------
@@ -150,14 +176,23 @@ if ($WorkspaceAdmins.Count -gt 0) {
     $adminsJson = '[]'
 }
 
+$templateParams = @(
+    "location=$Location"
+    "deploymentMode=$DeploymentMode"
+    "deployBookshelf=$deployBookshelf"
+    "deployTools=$deployTools"
+    "discoveryControlPlanePrincipalId=$discoveryPrincipalId"
+    "workspaceAdminPrincipalIds=$adminsJson"
+    "workspaceAdminPrincipalType=$WorkspaceAdminType"
+)
+if ($BookshelfIndexSize) {
+    $templateParams += "bookshelfIndexSize=$BookshelfIndexSize"
+}
+
 az deployment group validate `
     --resource-group $ResourceGroup `
     --template-file $TemplateFile `
-    --parameters location=$Location `
-                 deploymentMode=$DeploymentMode `
-                 discoveryControlPlanePrincipalId=$discoveryPrincipalId `
-                 workspaceAdminPrincipalIds=$adminsJson `
-                 workspaceAdminPrincipalType=$WorkspaceAdminType `
+    --parameters $templateParams `
     --only-show-errors -o none
 if ($LASTEXITCODE -ne 0) { throw 'テンプレートの検証に失敗しました。' }
 Write-Host '      検証 OK'
@@ -174,12 +209,8 @@ az deployment group create `
     --resource-group $ResourceGroup `
     --name $DeploymentName `
     --template-file $TemplateFile `
-    --parameters location=$Location `
-                 deploymentMode=$DeploymentMode `
-                 discoveryControlPlanePrincipalId=$discoveryPrincipalId `
-                 workspaceAdminPrincipalIds=$adminsJson `
-                 workspaceAdminPrincipalType=$WorkspaceAdminType `
-    --query "{state:properties.provisioningState, ws:properties.outputs.workspaceId.value, mode:properties.outputs.deploymentModeApplied.value}" `
+    --parameters $templateParams `
+    --query "{state:properties.provisioningState, ws:properties.outputs.workspaceId.value, mode:properties.outputs.deploymentModeApplied.value, bookshelf:properties.outputs.bookshelfEndpoint.value, tools:properties.outputs.toolNames.value}" `
     -o json
 if ($LASTEXITCODE -ne 0) { throw 'デプロイに失敗しました。' }
 
