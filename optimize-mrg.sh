@@ -48,6 +48,10 @@ TARGET_LAW_RETENTION_DAYS=30      # Log Analytics 保持期間 (最短)
 TARGET_LAW_DAILY_QUOTA_GB=1       # Log Analytics 日次取り込み上限
 TARGET_STORAGE_SKU="Standard_LRS" # ストレージ冗長性
 TARGET_STORAGE_TIER="Cool"        # ストレージアクセス層
+TARGET_SQL_OBJECTIVE="GP_S_Gen5_2" # Azure SQL: 汎用サーバーレス 2 vCore
+TARGET_SQL_AUTO_PAUSE_MIN=60       # Azure SQL: 自動一時停止までのアイドル分数
+TARGET_SEARCH_REPLICAS=1           # AI Search: レプリカ数 (AZ 冗長を捨てて半額化)
+TARGET_SEARCH_PARTITIONS=1         # AI Search: パーティション数
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -453,10 +457,80 @@ for rg in "${MRGS[@]}"; do
 done
 
 # ------------------------------------------------------------------
-# 9. 対象外リソースの明示
+# 9. Azure SQL Database (Bookshelf の Knowledge Base グラフ保存先)
+#    Bookshelf は既定で Hyperscale / ゾーン冗長の DB を作るため、アイドル時でも
+#    固定費が大きい。汎用サーバーレス + 自動一時停止へ寄せてアイドル課金を止める。
+#    ※ Hyperscale からのエディション変更は拒否されることがあるためベストエフォート。
+# ------------------------------------------------------------------
+log_head "Azure SQL Database (Bookshelf)"
+for rg in "${MRGS[@]}"; do
+  while IFS= read -r sqlsrv; do
+    [ -z "${sqlsrv}" ] && continue
+    while IFS=$'\t' read -r db objective zoned; do
+      [ -z "${db}" ] && continue
+      [ "${db}" = "master" ] && continue
+      log_sub "${rg} / ${sqlsrv} / ${db} (${objective})"
+
+      if [ "${objective}" = "${TARGET_SQL_OBJECTIVE}" ]; then
+        log_skip "DB ${db}: 既に ${TARGET_SQL_OBJECTIVE}"
+      else
+        run_change "DB ${db}: ${objective} -> ${TARGET_SQL_OBJECTIVE} (サーバーレス + 自動一時停止 ${TARGET_SQL_AUTO_PAUSE_MIN} 分)" \
+          az sql db update -g "${rg}" -s "${sqlsrv}" -n "${db}" \
+            --edition GeneralPurpose --family Gen5 --capacity 2 \
+            --compute-model Serverless --auto-pause-delay "${TARGET_SQL_AUTO_PAUSE_MIN}" -o none
+      fi
+
+      if [ "${zoned}" = "true" ]; then
+        run_change "DB ${db}: ゾーン冗長を無効化" \
+          az sql db update -g "${rg}" -s "${sqlsrv}" -n "${db}" --zone-redundant false -o none
+      else
+        log_skip "DB ${db}: ゾーン冗長は無効"
+      fi
+    done < <(az sql db list -g "${rg}" -s "${sqlsrv}" \
+               --query "[].[name, currentServiceObjectiveName, zoneRedundant]" -o tsv 2>/dev/null)
+  done < <(az sql server list -g "${rg}" --query "[].name" -o tsv 2>/dev/null)
+done
+
+# ------------------------------------------------------------------
+# 10. Azure AI Search (Bookshelf の Knowledge Base 検索)
+#     Bookshelf は既定で Standard S1 x 2 レプリカ (可用性ゾーン対応) を作る。
+#     検証用途ではレプリカ 1 で十分なため、半額化する。
+#     ※ SKU (S1 など) は作成時のみ指定可能で、後から変更できません。
+# ------------------------------------------------------------------
+log_head "Azure AI Search (Bookshelf)"
+log "   ※ SKU は作成時固定のため変更できません。レプリカ / パーティション数のみ調整します。"
+for rg in "${MRGS[@]}"; do
+  while IFS=$'\t' read -r svc sku replicas partitions; do
+    [ -z "${svc}" ] && continue
+    log_sub "${rg} / ${svc} (${sku} / replicas=${replicas} / partitions=${partitions})"
+
+    args=()
+    desc_parts=()
+    if [ "${replicas}" != "${TARGET_SEARCH_REPLICAS}" ]; then
+      args+=(--replica-count "${TARGET_SEARCH_REPLICAS}")
+      desc_parts+=("レプリカ ${replicas} -> ${TARGET_SEARCH_REPLICAS}")
+    fi
+    if [ "${partitions}" != "${TARGET_SEARCH_PARTITIONS}" ]; then
+      args+=(--partition-count "${TARGET_SEARCH_PARTITIONS}")
+      desc_parts+=("パーティション ${partitions} -> ${TARGET_SEARCH_PARTITIONS}")
+    fi
+
+    if [ ${#args[@]} -eq 0 ]; then
+      log_skip "${svc}: 既に最小構成"
+    else
+      old_ifs="$IFS"; IFS=', '; desc="${desc_parts[*]}"; IFS="$old_ifs"
+      run_change "${svc}: ${desc}" \
+        az search service update -g "${rg}" -n "${svc}" "${args[@]}" -o none
+    fi
+  done < <(az search service list -g "${rg}" \
+             --query "[].[name, sku.name, replicaCount, partitionCount]" -o tsv 2>/dev/null)
+done
+
+# ------------------------------------------------------------------
+# 11. 対象外リソースの明示
 # ------------------------------------------------------------------
 log_head "対象外 (意図的に変更しないもの)"
-log "   * Azure AI Search        : Basic プランのまま維持します。"
+log "   * AI Search の SKU      : 作成時固定のため変更できません (レプリカ数のみ調整)。"
 log "   * Private Endpoint       : 削除すると Discovery が動作しなくなるため触りません。"
 log "   * Private DNS ゾーン     : 同上。"
 log "   * NSP (ネットワーク境界) : 同上。"
@@ -465,9 +539,12 @@ log ""
 log "   💡 Private Endpoint は 1 本あたり月数ドルの固定費が発生します。"
 log "      本数を減らしたい場合は main.bicep の networkIsolation=false で"
 log "      ワークスペースを作り直してください (本スクリプトでは変更できません)。"
+log ""
+log "   💡 Bookshelf を使わない期間は deploy 時に SKIP_BOOKSHELF=1 を指定するか、"
+log "      Bookshelf リソースごと削除するのが最も確実なコスト削減です。"
 
 # ------------------------------------------------------------------
-# 10. サマリー
+# 12. サマリー
 # ------------------------------------------------------------------
 log_head "サマリー"
 if [ "$APPLY" = true ]; then

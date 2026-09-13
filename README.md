@@ -13,18 +13,26 @@ Bicep を使って Microsoft Discovery のインフラ一式を Azure にデプ�
 
 | カテゴリ     | リソース                               | 役割                                                                             |
 | ------------ | -------------------------------------- | -------------------------------------------------------------------------------- |
-| ネットワーク | 仮想ネットワーク + 6 サブネット        | スパコン/ワークスペース/エージェント/プライベートエンドポイント用                |
+| ネットワーク | 仮想ネットワーク + 7 サブネット        | スパコン/ワークスペース/エージェント/プライベートエンドポイント/Bookshelf 検索用 |
 | ID           | ユーザー割り当てマネージド ID (UAMI)   | 各 Discovery リソースの実行 ID                                                   |
-| ストレージ   | ストレージアカウント + Blob コンテナー | Discovery の出力保存先                                                           |
+| ID           | Bookshelf 用 UAMI                      | Knowledge Base が元資料 Blob を読むためのワークロード ID                         |
+| ストレージ   | ストレージアカウント + Blob コンテナー | Discovery の出力保存先 (`discoveryoutputs`)                                      |
+| ストレージ   | Knowledge 用 Blob コンテナー           | Knowledge Base にインデックスする元資料置き場 (`knowledgedocuments`)             |
 | Discovery    | Supercomputer（スパコン）              | 計算基盤（内部で AKS を構築）                                                    |
 | Discovery    | Node Pool                              | スパコンのノードプール                                                           |
 | Discovery    | Workspace                              | Discovery のワークスペース                                                       |
 | Discovery    | Chat Model Deployment                  | チャットモデル（gpt-5.4 など）                                                   |
 | Discovery    | Storage Container                      | Discovery 用ストレージ参照                                                       |
 | Discovery    | Project                                | ワークスペース配下のプロジェクト                                                 |
+| Discovery    | **Bookshelf**                          | Knowledge Base のホスト。作成すると専用 MRG に Azure SQL / AI Search / Container Apps が自動生成される |
+| Discovery    | **Knowledge 用 Storage Container / Storage Asset** | Knowledge Base 作成ウィザードで選択するデータ参照定義                |
+| Discovery    | **Tools**                              | Agent 作成画面の **Tools** 欄に並ぶツール定義 (`Microsoft.Discovery/tools`)       |
 | RBAC (UAMI)  | 3 つのロール割り当て                   | UAMI へ Storage Blob Data Contributor / Discovery Platform Contributor / AcrPull |
+| RBAC (Bookshelf) | Storage Blob Data Contributor      | Bookshelf 用 UAMI へ。これがないとインデックス時に元資料を読めない               |
 | RBAC (ユーザー) | Discovery Platform Administrator     | 実行ユーザー (または指定した Object ID) にワークスペースのデータプレーン権限を付与。**これがないと Discovery Studio 上で「Access denied」になり Agent 作成などができません** |
 | RBAC (サブスク) | NSP Perimeter Joiner + Reader        | Discovery ファーストパーティ SP にサブスクリプションスコープで自動付与 (NSP 構成のため)                     |
+
+> 💡 **Bookshelf と Tools は任意**です。`deployBookshelf=false` / `deployTools=false` (または `SKIP_BOOKSHELF=1` / `-SkipBookshelf`) でスキップできます。特に Bookshelf は本テンプレートで最も高額なオプションです ([1-2. Bookshelf と Knowledge Base](#1-2-bookshelf-と-knowledge-base) 参照)。
 
 ### `main.bicep` の主なパラメーター
 
@@ -45,6 +53,17 @@ Bicep を使って Microsoft Discovery のインフラ一式を Azure にデプ�
 | `networkIsolation` | `true` | Workspace の `NetworkIsolation` タグ |
 | `discoveryControlPlanePrincipalId` | (必須) | Discovery ファーストパーティ SP の **Object ID**。独自拡張 (NSP ロール付与用)。`deploy.ps1` / `deploy.sh` が自動解決 |
 | `workspaceAdminPrincipalIds` | `[]` | Discovery Platform Administrator を付与する Entra Object ID の配列。独自拡張 |
+| `deployBookshelf` | `true` | Bookshelf と Knowledge 用ストレージ一式 (Blob コンテナー / Storage Container / Storage Asset / UAMI / RBAC) を作成するか |
+| `bookshelfName` | `bks-<uniq>` | Bookshelf 名。データプレーンエンドポイント `https://<name>.bookshelf.discovery.azure.com` に使われる |
+| `bookshelfIndexSize` | `''` (モード既定) | Bookshelf の `indexSize` タグ。`small` / `medium` / `large`。MRG の計算規模を決める最大のコスト要因 |
+| `bookshelfPublicNetworkAccess` | `''` (`networkIsolation` 連動) | Bookshelf データプレーンの公開接続。空のとき `networkIsolation=true` なら `Disabled` |
+| `bookshelfSearchSubnetName` / `bookshelfSearchSubnetPrefix` | `bookshelfSearchSubnet` / `10.0.7.0/24` | Bookshelf のマネージド AI Search 用サブネット。**プライベートエンドポイント用とは別のサブネットが必須** |
+| `knowledgeBlobContainerName` | `knowledgedocuments` | Knowledge Base にインデックスする元資料を置く Blob コンテナー |
+| `knowledgeStorageContainerName` / `knowledgeStorageAssetName` | `kstc-<uniq>` / `kasset-<uniq>` | Knowledge Base 作成ウィザードで選択する Discovery 側の参照定義 |
+| `knowledgeStorageAssetPath` | `''` (= `<knowledgeBlobContainerName>/`) | ストレージアカウントルートからの相対パス。サブフォルダーも指定可 |
+| `deployTools` | `true` | `Microsoft.Discovery/tools` を作成するか |
+| `tools` | `[]` (= サンプル 1 件) | ツール定義の配列。詳細は [1-3. Discovery ツール](#1-3-discovery-ツール) |
+| `toolEnvironmentVariables` | `{}` | 全ツールにマージする追加の環境変数 |
 
 > ⚠️ **`networkIsolation`**: 既定は `true` ですが、Discovery Studio のワークベンチは現時点で `false` のときのみ接続できます。パブリックプレビューのワークベンチにアクセスしたい場合は `-Parameters networkIsolation=false` を指定してください。
 
@@ -75,6 +94,8 @@ Bicep を使って Microsoft Discovery のインフラ一式を Azure にデプ�
 | `supercomputerSystemSku` (AKS システムノードプール SKU) | `Standard_D4s_v6` | `Standard_D4s_v6` | Discovery が許可する SKU は `Standard_D4s_v4/v5/v6` の 3 つのみ (いずれも 4 vCPU) |
 | `storageAccountSku` (ストレージ冗長性) | `Standard_LRS` | `Standard_GRS` | LRS は GRS の約半額 (地理冗長なし) |
 | `storageAccessTier` (アクセス層) | `Cool` | `Hot` | 保存容量単価が下がる (読み書きトランザクション単価は上がる) |
+| `bookshelfIndexSize` (Bookshelf の規模) | `small` | `medium` | Bookshelf MRG の AI Search / SQL / Container Apps の計算量を決める。`small` は約 200 MB までのテキストが対象 |
+| `toolMaxParallelism` (ツールの並列度ヒント) | `1` | `3` | 全ツールに `DISCOVERY_MAX_PARALLELISM` として渡る。ノードプールの最大ノード数に連動 |
 
 ### モードの切り替え方
 
@@ -137,6 +158,9 @@ az deployment group create -g discoveryRG --template-file main.bicep \
 | Supercomputer | システムノードプール SKU | `Standard_D4s_v6` | `Standard_D4s_v6` |
 | ストレージアカウント | 冗長性 | `Standard_LRS` | `Standard_GRS` |
 | ストレージアカウント | アクセス層 | `Cool` | `Hot` |
+| Bookshelf | `indexSize` タグ | `small` | `medium` |
+| Bookshelf | 公開ネットワークアクセス | `networkIsolation` 連動 | `networkIsolation` 連動 |
+| Tools | `DISCOVERY_MAX_PARALLELISM` | `1` | `3` |
 
 #### フェーズ 2: デプロイ後スクリプトで制御する (マネージドリソースグループ `mrg-...`)
 
@@ -153,9 +177,18 @@ az deployment group create -g discoveryRG --template-file main.bicep \
 | Log Analytics | 日次取り込み上限 | `1` GB | 変更しない |
 | ストレージアカウント (MRG 内) | 冗長性 | `Standard_LRS` | 変更しない |
 | ストレージアカウント (MRG 内) | アクセス層 | `Cool` | 変更しない |
-| Azure AI Search | — | **変更しない (Basic 維持)** | 変更しない |
+| **Azure SQL (Bookshelf MRG)** | サービスレベル | `GP_S_Gen5_2` (汎用サーバーレス 2 vCore) | 変更しない |
+| **Azure SQL (Bookshelf MRG)** | 自動一時停止 | `60` 分アイドルで停止 | 変更しない |
+| **Azure SQL (Bookshelf MRG)** | ゾーン冗長 | 無効化 | 変更しない |
+| **Azure AI Search (Bookshelf MRG)** | レプリカ数 | `1` (既定の 2 から半額化) | 変更しない |
+| **Azure AI Search (Bookshelf MRG)** | パーティション数 | `1` | 変更しない |
+| Azure AI Search | SKU (S1 など) | **変更しない (作成時固定で変更不可)** | 変更しない |
 | Private Endpoint / Private DNS / NSP | — | **変更しない** (削除すると Discovery が壊れるため) | 変更しない |
 | AI Foundry / Azure OpenAI | — | 変更しない (従量課金のためアイドル時の課金なし) | 変更しない |
+
+> ⚠️ **Azure SQL の Hyperscale からのエディション変更は拒否されることがあります。** スクリプトはベストエフォートなので、失敗しても他の項目は継続します。
+
+> ⚠️ **AI Search のレプリカを 1 にすると可用性ゾーン冗長と SLA を失います。** 本番用途では `Production` モードを使うか、MRG 最適化をスキップしてください。
 
 > ⚠️ **Cosmos DB のサーバーレス化はできません。** `EnableServerless` は**アカウント作成時のみ**指定可能で、既存アカウントへの後付けは Azure の仕様上不可能です (逆方向のみ一方向で移行可)。Discovery が作成した Cosmos DB を作り直すこともできないため、代替として Autoscale 化 + 最大 RU の引き下げを行っています。
 
@@ -163,7 +196,15 @@ az deployment group create -g discoveryRG --template-file main.bicep \
 
 ### Discovery が自動作成するマネージドリソースについて
 
-Workspace / Supercomputer を作ると、Discovery コントロールプレーンが **管理用リソースグループ (`mrg-dwsp-*` / `mrg-dscmp-*`)** に Azure Container Apps 環境・Cosmos DB・AI Search・AKS クラスター・Log Analytics・ストレージなどを自動生成します。これらは `Microsoft.Discovery` の ARM API (`2026-06-01`) に設定項目が公開されていないため、**Bicep からは SKU やスケール設定を指定できません**。
+Workspace / Supercomputer / Bookshelf を作ると、Discovery コントロールプレーンが **管理用リソースグループ** に各種リソースを自動生成します。
+
+| MRG 名の接頭辞 | 作成元 | 主に入るもの |
+| --- | --- | --- |
+| `mrg-dwsp-*` | Workspace | Container Apps 環境 / Cosmos DB / AI Search / Log Analytics / ストレージ |
+| `mrg-dscmp-*` | Supercomputer | AKS クラスター / ストレージ |
+| `mrg-dbksf-*` | **Bookshelf** | **Azure SQL (Knowledge Graph) / AI Search / Container Apps / ストレージ** |
+
+これらは `Microsoft.Discovery` の ARM API (`2026-06-01`) に設定項目が公開されていないため、**Bicep からは SKU やスケール設定を指定できません**。
 
 そのため本リポジトリでは **2 フェーズ方式** を採っています。
 
@@ -211,10 +252,191 @@ SKIP_MRG_OPTIMIZE=1 ./deploy.sh
 | **事前チェック** | 拒否割り当て (deny assignment) とリソースロックの有無を確認し、警告を表示します |
 | **サマリー出力** | 最後に 成功 / スキップ / 失敗 の件数と、失敗した項目の一覧を表示します |
 | **破壊的操作なし** | Private Endpoint / Private DNS / NSP には一切触れません |
+| **Bookshelf 対応** | `mrg-dbksf-*` も対象に含め、Azure SQL のサーバーレス化と AI Search のレプリカ削減を行います |
 
 > 💡 いずれの変更も Discovery のバージョンアップや再プロビジョニングで **元の設定に戻る可能性** があります。スクリプトは冪等なので、定期的に再実行してください。恒久的なコスト削減としては「使わないときは RG ごと削除する」(6. クリーンアップ参照) が最も確実です。
 
 > ⚠️ MRG は Discovery が所有する領域です。手動変更は **Microsoft のサポート対象外** になり得ます。検証環境での自己責任での実施を推奨します。
+
+---
+
+## 1-2. Bookshelf と Knowledge Base
+
+### なぜ Bookshelf が必要か
+
+**Knowledge Base は単体では存在できず、必ず Bookshelf の配下に作られます。** また Bookshelf 1 つにつき Knowledge Base は 1 つです (現時点の制限)。
+
+```text
+Bookshelf (ARM リソース / 本テンプレートが作成)
+  └─ Knowledge Base (データプレーン / Discovery Studio で作成)
+       └─ Storage Asset → Blob コンテナーの元資料
+```
+
+### 本テンプレートが作るもの / 作らないもの
+
+| 項目 | 作成場所 |
+| --- | --- |
+| Bookshelf | ✅ Bicep (`Microsoft.Discovery/bookshelves`) |
+| Bookshelf 用 UAMI | ✅ Bicep |
+| UAMI への Storage Blob Data Contributor | ✅ Bicep |
+| Knowledge 用 Blob コンテナー | ✅ Bicep |
+| Discovery Storage Container / Storage Asset | ✅ Bicep |
+| Bookshelf 用検索サブネット | ✅ Bicep |
+| **元資料のアップロード** | ❌ 手動 (Azure Portal / Storage Explorer / `az storage blob upload-batch`) |
+| **Knowledge Base 本体** | ❌ Discovery Studio > Resources > Knowledge |
+| **Index の実行** | ❌ Discovery Studio (Knowledge Base 詳細画面の Index ボタン) |
+
+Knowledge Base の作成と Index は **データプレーン操作** で ARM のライフサイクル外のため、Bicep では作成できません。
+
+### デプロイ後の手順
+
+```bash
+# 1. 元資料をアップロード (対応形式: pdf / docx / pptx / xlsx / txt / html)
+STG=$(az deployment group show -g discoveryRG -n <デプロイ名> \
+        --query "properties.outputs.storageAccountId.value" -o tsv | awk -F/ '{print $NF}')
+az storage blob upload-batch \
+  --account-name "${STG}" --auth-mode login \
+  --destination knowledgedocuments --source ./docs
+```
+
+2. Discovery Studio > 左メニュー **Resources** > **Knowledge**
+3. **Bookshelf** ドロップダウンで本テンプレートが作った Bookshelf を選択 → **+ Create new**
+4. Name / Version / Description / Copilot instruction を入力
+5. **Storage Container** / **Storage Asset** / **User Assigned Identity** はすべて本テンプレートが作成済みのものを選択 (デプロイ出力の `knowledgeStorageContainerId` / `knowledgeStorageAssetId` / `bookshelfIdentityId`)
+6. **Create** → 詳細画面の **Index** ボタンで Project と Node Pool を選び **Start Indexing**
+
+### ⚠️ Index 用ノードプールについて
+
+インデックス処理は **メモリ集約的** です。本テンプレートの既定ノードプールは `Standard_D4s_v6` (4 vCPU / 16 GB) なので、公式推奨値を満たしません。
+
+| Index サイズ | テキスト量 | 公式推奨 SKU | メモリ |
+| --- | --- | --- | --- |
+| Small | 約 200 MB | `Standard_E20s_v6` | 160 GB |
+| Medium | 約 500 MB | `Standard_E64s_v6` | 512 GB |
+| Large | 約 1 GB | `Standard_E96s_v6` | 768 GB |
+
+少量の検証であれば既定ノードプールでも動く可能性がありますが、失敗する場合は **Index 実行時だけ** メモリ最適化ノードプールを追加し、終わったら削除するのがコスト面で有利です。
+
+```bash
+# Index 用ノードプールを一時的に追加 (最小 0 台なので未使用時は課金されない)
+az deployment group create -g discoveryRG --template-file main.bicep \
+  --parameters nodePoolName=idxpool nodePoolVmSize=Standard_E20s_v6 \
+               nodePoolMaxNodeCount=1 nodePoolMinNodeCount=0
+```
+
+### ⚠️ モデルのクォータ
+
+Knowledge Base の Index と検索には、チャットモデルとは別に以下が必要です。**本テンプレートはこれらのモデルデプロイを作成しません。**
+
+| モデル | 用途 | Bookshelf 作成時 | Index / 検索時の推奨 |
+| --- | --- | --- | --- |
+| `text-embedding-3-small` | Embedding | 200,000 TPM | 2,000,000 TPM |
+| `GPT-5.2` | Knowledge Base 検索 | 200,000 TPM | 2,000,000 TPM |
+| `GPT-5-mini` | Knowledge Base 検索 | 200,000 TPM | 10,000,000 TPM |
+
+> 💡 TPM クォータは Index 完了後に引き下げられます。クォータの確保自体には課金は発生しませんが、他のワークロードを圧迫します。
+
+### Bookshelf を作らないデプロイ
+
+Knowledge 機能が不要なら、Bookshelf MRG の固定費 (Azure SQL / AI Search / Container Apps) を丸ごと回避できます。
+
+```bash
+SKIP_BOOKSHELF=1 ./deploy.sh
+```
+
+```powershell
+./deploy.ps1 -SkipBookshelf
+```
+
+---
+
+## 1-3. Discovery ツール
+
+### Discovery Studio ではツールを「作れない」
+
+Discovery Studio の Agent 作成画面にある **Tools** 欄は、ワークスペースにすでに存在するツールを **選択するだけ** の UI です。ツール実体は ARM リソース `Microsoft.Discovery/tools` なので、**Bicep / CLI で作成する必要があります**。作成していなければ Tools 欄は空のままです。
+
+### ツール定義の形式
+
+`tools` パラメーターに配列で渡します。省略するとサンプルツール (`dataset-summary`) が 1 件作られます。
+
+| キー | 必須 | 説明 |
+| --- | --- | --- |
+| `name` | ✅ | ARM リソース名。`^[a-zA-Z0-9-]{3,24}$` |
+| `version` | ✅ | ツール定義のバージョン文字列 |
+| `definitionContent` | ✅ | `tool_id` / `name` / `description` / `actions[]` を含む JSON |
+| `environmentVariables` | — | そのツール固有の環境変数 |
+
+`actions[]` の各要素は `name` / `description` / `input_schema` (JSON Schema) / `command` / `environment_variables[]` で構成されます。`{{ 変数名 }}` で `input_schema` の入力値を参照できます。
+
+```bicep
+// 例: パラメーターファイルで自前ツールを渡す
+param tools = [
+  {
+    name: 'md-simulation'
+    version: '1.0.0'
+    definitionContent: {
+      tool_id: 'md-simulation'
+      name: 'MolecularDynamics'
+      description: '分子動力学シミュレーションを実行します。'
+      actions: [
+        {
+          name: 'RunSimulation'
+          description: '構造を /app/inputs にマウントし、/app/outputs をキャプチャしてください。'
+          input_schema: {
+            type: 'object'
+            properties: {
+              steps: { type: 'string', description: 'ステップ数' }
+            }
+            required: [ 'steps' ]
+          }
+          command: 'python3 run_md.py'
+          environment_variables: [
+            { name: 'STEPS', value: '{{ steps }}' }
+          ]
+        }
+      ]
+    }
+  }
+]
+```
+
+### 全ツールに自動注入される環境変数
+
+ツールのコマンドがデプロイ構成に合わせて振る舞えるよう、以下を全ツールにマージします。
+
+| 環境変数 | 値 |
+| --- | --- |
+| `DISCOVERY_DEPLOYMENT_MODE` | `CostOptimized` / `Production` |
+| `DISCOVERY_NODE_POOL_NAME` | ノードプール名 |
+| `DISCOVERY_STORAGE_CONTAINER_NAME` | Discovery Storage Container 名 |
+| `DISCOVERY_MAX_PARALLELISM` | ノードプールの最大ノード数 (コストモード連動: `1` / `3`) |
+
+`toolEnvironmentVariables` パラメーターで任意の変数を追加できます。
+
+### コスト
+
+**ツールリソース自体にランニングコストはありません。** ツールは定義 (JSON) に過ぎず、課金が発生するのは Agent がツールを実行してノードプールがスケールアウトしたときだけです。そのためツールは両モードとも既定でデプロイします。
+
+作成しない場合は以下です。
+
+```bash
+SKIP_TOOLS=1 ./deploy.sh
+```
+
+```powershell
+./deploy.ps1 -SkipTools
+```
+
+### 確認方法
+
+```bash
+az resource list -g discoveryRG \
+  --resource-type Microsoft.Discovery/tools \
+  --query "[].{name:name, state:properties.provisioningState}" -o table
+```
+
+作成後、Discovery Studio > Projects > 対象 Project > Resources > Agents > **Create new agent** > **Tools** に一覧表示されます。
 
 ---
 
@@ -228,6 +450,8 @@ SKIP_MRG_OPTIMIZE=1 ./deploy.sh
 - [ ] **Microsoft Discovery の利用が承認済み** のサブスクリプションであること
 - [ ] デプロイ先が **対応リージョン** であること（後述）
 - [ ] 十分な **クォータ**（特に `Standard_D4s_v6` の vCPU）が確保されていること
+- [ ] (Bookshelf を使う場合) **Azure SQL / AI Search / Container Apps のクォータ** が確保されていること
+- [ ] (Knowledge Base を使う場合) **Embedding / GPT モデルの TPM クォータ** が確保されていること ([1-2](#1-2-bookshelf-と-knowledge-base) 参照)
 
 ### 対応リージョン
 
@@ -259,6 +483,15 @@ az account set --subscription "<サブスクリプションID>"
 
 # リージョンやRG名を変える場合（対応リージョンは eastus / uksouth / swedencentral）
 LOCATION=eastus RG=myDiscoveryRG ./deploy.sh
+
+# Bookshelf を作らない (Knowledge 機能不要 / コスト最小)
+SKIP_BOOKSHELF=1 ./deploy.sh
+
+# Discovery ツールを作らない
+SKIP_TOOLS=1 ./deploy.sh
+
+# Bookshelf の規模を明示指定
+BOOKSHELF_INDEX_SIZE=medium ./deploy.sh
 ```
 
 ### PowerShell (Windows / クロスプラットフォーム)
@@ -279,35 +512,46 @@ az account set --subscription "<サブスクリプションID>"
 
 # セキュリティグループを管理者に指定 (Type を Group に切り替え)
 ./deploy.ps1 -WorkspaceAdmins @('<groupObjId>') -WorkspaceAdminType Group
+
+# Bookshelf / Discovery ツールを作らない
+./deploy.ps1 -SkipBookshelf
+./deploy.ps1 -SkipTools
+
+# Bookshelf の規模を明示指定
+./deploy.ps1 -BookshelfIndexSize medium
 ```
 
 ### スクリプトの自動処理内容
 
 どちらのスクリプトも以下を自動で行います:
 
-1. ログイン状態の確認 (+ PowerShell 版は **サインインユーザーの Object ID を自動取得**)
+1. ログイン状態の確認と **サインインユーザーの Object ID 自動取得** (Discovery Studio 管理者権限の付与に使用)
 2. `Microsoft.Discovery` プロバイダー & `DiscoveryEnabled` フィーチャーの登録 (登録完了まで待機)
 3. Discovery ファーストパーティ SP (App ID `92c174ac-8e41-4815-a1b7-d81b19ab03ce`) の存在確認 / 自動作成
 4. リソースグループ作成 (べき等)
 5. Bicep テンプレートの検証
-6. デプロイ実行 (**サブスクリプションスコープの RBAC も含めて完結**)
+6. デプロイ実行 (**サブスクリプションスコープの RBAC、Bookshelf、Discovery ツールを含めて完結**)
+7. コスト最適化モードのときは MRG のコスト最適化 (`optimize-mrg`) を実行
 
-### `deploy.ps1` のオプション一覧
+### デプロイスクリプトのオプション一覧
 
-| パラメータ / 環境変数 | 既定値 | 説明 |
-| --- | --- | --- |
-| `-Location` / `LOCATION` | `swedencentral` | デプロイ先リージョン (`eastus` / `uksouth` / `swedencentral`) |
-| `-ResourceGroup` / `RG` | `discoveryRG` | 作成先リソースグループ名。存在しない場合は自動作成 |
-| `-DeploymentName` / `DEPLOYMENT_NAME` | `discovery-<yyyyMMdd-HHmmss>` | Azure デプロイ名 (履歴に表示される名前) |
-| `-TemplateFile` / `TEMPLATE_FILE` | `main.bicep` | 使用する Bicep テンプレート |
-| `-WorkspaceAdmins` | `@()` → **サインインユーザーを自動追加** | Discovery Studio (データプレーン) の管理者にする Object ID の配列 |
-| `-WorkspaceAdminType` | `User` | `WorkspaceAdmins` の種別。`User` / `Group` / `ServicePrincipal` |
-| `-DeploymentMode` / `DEPLOYMENT_MODE` | `CostOptimized` | コストモード。`CostOptimized` / `Production` ([1-1. コストモード](#1-1-コストモードdeploymentmode)) |
-| `-SkipMrgOptimize` / `SKIP_MRG_OPTIMIZE=1` | (未指定) | コスト最適化モードでもデプロイ後の MRG 最適化スクリプトを実行しない |
+| `deploy.ps1` | `deploy.sh` (環境変数) | 既定値 | 説明 |
+| --- | --- | --- | --- |
+| `-Location` | `LOCATION` | `swedencentral` | デプロイ先リージョン (`eastus` / `uksouth` / `swedencentral`) |
+| `-ResourceGroup` | `RG` | `discoveryRG` | 作成先リソースグループ名。存在しない場合は自動作成 |
+| `-DeploymentName` | `DEPLOYMENT_NAME` | `discovery-<yyyyMMdd-HHmmss>` | Azure デプロイ名 (履歴に表示される名前) |
+| `-TemplateFile` | `TEMPLATE_FILE` | `main.bicep` | 使用する Bicep テンプレート |
+| `-DeploymentMode` | `DEPLOYMENT_MODE` | `CostOptimized` | コストモード。`CostOptimized` / `Production` ([1-1. コストモード](#1-1-コストモードdeploymentmode)) |
+| `-WorkspaceAdmins` | (自動) | サインインユーザーを自動追加 | Discovery Studio (データプレーン) の管理者にする Object ID の配列 |
+| `-WorkspaceAdminType` | (なし) | `User` | `WorkspaceAdmins` の種別。`User` / `Group` / `ServicePrincipal` |
+| `-SkipMrgOptimize` | `SKIP_MRG_OPTIMIZE=1` | (未指定) | コスト最適化モードでもデプロイ後の MRG 最適化スクリプトを実行しない |
+| `-SkipBookshelf` | `SKIP_BOOKSHELF=1` | (未指定) | Bookshelf と Knowledge 用ストレージ一式を作成しない ([1-2](#1-2-bookshelf-と-knowledge-base)) |
+| `-SkipTools` | `SKIP_TOOLS=1` | (未指定) | `Microsoft.Discovery/tools` を作成しない ([1-3](#1-3-discovery-ツール)) |
+| `-BookshelfIndexSize` | `BOOKSHELF_INDEX_SIZE` | (モード既定) | Bookshelf の規模。`small` / `medium` / `large` |
 
 > ✅ **`-WorkspaceAdmins` を省略しても、スクリプトが `az ad signed-in-user show` でサインインユーザーの Object ID を自動取得し、Discovery Platform Administrator ロールを付与します。** デプロイ直後から Discovery Studio で Agent / Project 作成が可能です。
 >
-> 逆にサービスプリンシパルでログインしている場合は `-WorkspaceAdmins @('<objId>')` を明示指定してください (自動取得はスキップされ、警告が出ます)。
+> 逆にサービスプリンシパルでログインしている場合は `-WorkspaceAdmins @('<objId>')` を明示指定してください (自動取得はスキップされ、警告が出ます)。`deploy.sh` は常にサインインユーザーを自動付与します。
 
 ### 同一サブスクリプション内で複数リージョンにデプロイする
 
@@ -324,7 +568,7 @@ az account set --subscription "<サブスクリプションID>"
 中のカスタムロールと RBAC は GUID ベースで冪等なので、両方のデプロイで同じ Discovery ファーストパーティ SP を共有しても衝突しません。
 
 ---
-Windows User の場合、`deploy.ps1` を使ってください。Bash 版 (`deploy.sh`) では Studio 管理者ロールの自動付与機能は未実装なので、デプロイ後に手動でロール割り当てが必要です (下記 5-7 参照)。
+Windows ユーザーは `deploy.ps1`、Linux / macOS / WSL ユーザーは `deploy.sh` を使ってください。どちらも Discovery SP の解決、Studio 管理者ロールの自動付与、Bookshelf / Discovery ツールのデプロイに対応しています。サービスプリンシパルでログインしている場合のみ、Studio 権限を手動で付与する必要があります (下記 5-7 参照)。
 
 ## 4. 手動デプロイ（スクリプトを使わない場合）
 
@@ -342,11 +586,24 @@ az provider show --namespace Microsoft.Discovery --query registrationState -o ts
 az group create --name discoveryRG --location swedencentral
 
 # デプロイ (deploymentMode を省略するとコスト最適化モード)
+# discoveryControlPlanePrincipalId は必須。事前に Object ID を解決する
+DISC_SP=$(az ad sp show --id 92c174ac-8e41-4815-a1b7-d81b19ab03ce --query id -o tsv)
+
 az deployment group create \
   --resource-group discoveryRG \
   --name discovery-deploy \
   --template-file main.bicep \
-  --parameters location=swedencentral deploymentMode=CostOptimized
+  --parameters location=swedencentral deploymentMode=CostOptimized \
+               discoveryControlPlanePrincipalId="${DISC_SP}"
+
+# Bookshelf / Discovery ツールを作らない場合
+az deployment group create \
+  --resource-group discoveryRG \
+  --name discovery-deploy \
+  --template-file main.bicep \
+  --parameters location=swedencentral deploymentMode=CostOptimized \
+               discoveryControlPlanePrincipalId="${DISC_SP}" \
+               deployBookshelf=false deployTools=false
 ```
 
 ### デプロイ状況の確認
@@ -356,10 +613,20 @@ az deployment group create \
 az resource list -g discoveryRG \
   --query "[?contains(type,'Microsoft.Discovery')].{name:name,type:type}" -o table
 
+# Bookshelf と Discovery ツールだけを抽出
+az resource list -g discoveryRG \
+  --query "[?type=='Microsoft.Discovery/bookshelves' || type=='Microsoft.Discovery/tools'].{name:name,type:type,state:properties.provisioningState}" \
+  -o table
+
 # ワークスペースのプロビジョニング状態
 az rest --method get \
   --url "https://management.azure.com/subscriptions/<SUB>/resourceGroups/discoveryRG/providers/Microsoft.Discovery/workspaces/<WS名>?api-version=2026-06-01" \
   --query "properties.provisioningState" -o tsv
+
+# Knowledge Base 作成ウィザードで選ぶリソースの ID を取得
+az deployment group show -g discoveryRG -n <デプロイ名> \
+  --query "{bookshelf:properties.outputs.bookshelfEndpoint.value, container:properties.outputs.knowledgeStorageContainerId.value, asset:properties.outputs.knowledgeStorageAssetId.value, identity:properties.outputs.bookshelfIdentityId.value}" \
+  -o json
 ```
 
 ---
@@ -486,13 +753,15 @@ az group delete --name discoveryRG --yes --no-wait
 
 | ファイル                           | 説明                                             |
 | ---------------------------------- | ------------------------------------------------ |
-| `main.bicep`                     | Discovery インフラ一式の Bicep テンプレート (Discovery Studio 権限付与含む) |
+| `main.bicep`                     | Discovery インフラ一式の Bicep テンプレート (Studio 権限付与 / Bookshelf / Knowledge ストレージ / Discovery ツールを含む) |
 | `subscription-roles.bicep`       | サブスクリプションスコープモジュール (NSP Joiner カスタムロール作成 + Discovery SP へ割り当て) |
-| `deploy.sh`                      | プロバイダー登録〜デプロイを自動化する Bash スクリプト |
+| `deploy.sh`                      | プロバイダー登録〜デプロイを自動化する Bash スクリプト (サインインユーザーを Studio 管理者に自動指定) |
 | `deploy.ps1`                     | PowerShell 版デプロイスクリプト (サインインユーザーを Studio 管理者に自動指定) |
-| `optimize-mrg.sh`                | デプロイ後に Discovery のマネージドリソースグループをコスト最適化する Bash スクリプト (ベストエフォート / ドライラン既定) |
+| `optimize-mrg.sh`                | デプロイ後に Discovery のマネージドリソースグループ (Workspace / Supercomputer / Bookshelf) をコスト最適化する Bash スクリプト (ベストエフォート / ドライラン既定) |
 | `optimize-mrg.ps1`               | PowerShell 版 MRG コスト最適化スクリプト |
 | `nsp-perimeter-joiner-role.json` | (参考) NSP 構成用カスタムロール定義 JSON。通常は Bicep が自動作成するので手動使用は不要 |
+| `resources.md`                   | デプロイされるリソース一覧と依存関係図 |
+| `TROUBLESHOOTING.md`             | 実際に踏んだ罠と解決策のメモ |
 | `README.md`                      | 本手順書                                         |
 | `TROUBLESHOOTING.md`             | 追加のトラブルシューティングメモ                 |
 

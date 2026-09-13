@@ -111,6 +111,11 @@ param agentSubnetPrefix string = '10.0.5.0/24'
 @description('Address prefix for Search Subnet.')
 param searchSubnetPrefix string = '10.0.6.0/24'
 
+// The Bookshelf managed AI Search instance needs its own, non-delegated subnet
+// that is distinct from the private endpoint subnet.
+@description('Address prefix for the Bookshelf Search subnet (must differ from the Private Endpoint subnet).')
+param bookshelfSearchSubnetPrefix string = '10.0.7.0/24'
+
 @description('VM SKU for the Node Pool. Leave empty to use the deploymentMode preset (Standard_D4s_v6 in both modes).')
 param nodePoolVmSize string = ''
 
@@ -212,6 +217,94 @@ param workspaceAdminPrincipalIds array = []
 param workspaceAdminPrincipalType string = 'User'
 
 // -----------------------------------------------------------------------------
+// Bookshelf (Knowledge Base host).
+//
+// A Knowledge Base cannot exist on its own: it always lives inside a Bookshelf
+// control-plane resource. Creating the Bookshelf provisions its own managed
+// resource group containing Azure SQL, AI Search, Container Apps and Storage,
+// so it is the single most expensive optional component of this template.
+// Set deployBookshelf=false to skip the whole Knowledge stack.
+//
+// The Knowledge Base itself (and its indexing run) is a data-plane object that
+// is created from Discovery Studio -> Resources -> Knowledge, not from ARM.
+// This template provisions everything that Studio asks you to pick in that
+// wizard: the Bookshelf, the workload identity, the source blob container, the
+// Discovery storage container and the storage asset.
+//
+// Docs: https://learn.microsoft.com/azure/microsoft-discovery/how-to-index-bookshelf-knowledgebase
+// -----------------------------------------------------------------------------
+@description('Deploy the Bookshelf and the Knowledge Base source storage (blob container, Discovery storage container, storage asset, workload identity). Set to false to skip the Knowledge stack entirely.')
+param deployBookshelf bool = true
+
+@description('Name of the Microsoft Discovery Bookshelf. Becomes part of the data-plane endpoint https://<name>.bookshelf.discovery.azure.com.')
+@minLength(3)
+@maxLength(24)
+param bookshelfName string = 'bks-${uniqueString(resourceGroup().id)}'
+
+@description('Name of the User-Assigned Managed Identity used by the Bookshelf knowledgebase workloads to read the source documents.')
+param bookshelfIdentityName string = 'uami-bks-${uniqueString(resourceGroup().id)}'
+
+@description('Bookshelf indexSize tag. Controls the compute provisioned in the Bookshelf managed resource group. Leave empty to use the deploymentMode preset (CostOptimized: small, Production: medium).')
+@allowed([
+  ''
+  'small'
+  'medium'
+  'large'
+])
+param bookshelfIndexSize string = ''
+
+@description('Public network access for the Bookshelf data-plane endpoint. Leave empty to derive it from networkIsolation (true -> Disabled, false -> Enabled).')
+@allowed([
+  ''
+  'Enabled'
+  'Disabled'
+])
+param bookshelfPublicNetworkAccess string = ''
+
+@description('Name of the subnet used by the Bookshelf managed AI Search instance. Must not be the private endpoint subnet.')
+param bookshelfSearchSubnetName string = 'bookshelfSearchSubnet'
+
+@description('Name of the blob container that holds the source documents indexed into the Knowledge Base.')
+param knowledgeBlobContainerName string = 'knowledgedocuments'
+
+@description('Name of the Microsoft Discovery Storage Container resource that exposes the knowledge documents to Discovery.')
+@minLength(3)
+@maxLength(24)
+param knowledgeStorageContainerName string = 'kstc-${uniqueString(resourceGroup().id)}'
+
+@description('Name of the Storage Asset that points at the knowledge documents inside the storage container.')
+@minLength(3)
+@maxLength(24)
+param knowledgeStorageAssetName string = 'kasset-${uniqueString(resourceGroup().id)}'
+
+@description('Path of the knowledge documents relative to the storage account root. Leave empty to use "<knowledgeBlobContainerName>/".')
+param knowledgeStorageAssetPath string = ''
+
+@description('Description shown in Discovery Studio for the knowledge storage asset.')
+param knowledgeStorageAssetDescription string = 'Source documents indexed into the Bookshelf Knowledge Base.'
+
+// -----------------------------------------------------------------------------
+// Discovery Tools.
+//
+// Microsoft.Discovery/tools is a first-class ARM resource: a tool is a JSON
+// definition (id, name, description and a list of actions with their input
+// schema and command) that Discovery Studio then offers in the "Tools" section
+// of the agent creation form. Studio can only *select* tools, so they have to
+// be created here.
+//
+// Docs: https://learn.microsoft.com/rest/api/discovery/tools/create-or-update
+// -----------------------------------------------------------------------------
+@description('Deploy the Microsoft.Discovery/tools resources listed in the tools parameter.')
+param deployTools bool = true
+
+@description('Tool definitions to create. Each item needs name, version and definitionContent; environmentVariables is optional and is merged with the template-wide tool environment. Leave empty to deploy the built-in sample tool.')
+param tools array = []
+
+@description('Extra environment variables merged into every deployed tool, on top of the template-managed DISCOVERY_* values.')
+param toolEnvironmentVariables object = {}
+
+
+// -----------------------------------------------------------------------------
 // Cost presets
 //
 // modePresets holds one parameter set per deploymentMode. Changing the single
@@ -233,6 +326,9 @@ var modePresets = {
     // Storage: locally-redundant + cool tier is the cheapest durable option.
     storageAccountSku: 'Standard_LRS'
     storageAccessTier: 'Cool'
+    // Bookshelf: the smallest index sizes the least expensive AI Search / SQL /
+    // Container Apps footprint in the Bookshelf managed resource group.
+    bookshelfIndexSize: 'small'
   }
   Production: {
     nodePoolVmSize: 'Standard_D4s_v6'
@@ -243,6 +339,7 @@ var modePresets = {
     supercomputerSystemSku: 'Standard_D4s_v6'
     storageAccountSku: 'Standard_GRS'
     storageAccessTier: 'Hot'
+    bookshelfIndexSize: 'medium'
   }
 }
 
@@ -260,6 +357,84 @@ var effectiveSupercomputerSystemSku = empty(supercomputerSystemSku)
   : supercomputerSystemSku
 var effectiveStorageAccountSku = empty(storageAccountSku) ? preset.storageAccountSku : storageAccountSku
 var effectiveStorageAccessTier = empty(storageAccessTier) ? preset.storageAccessTier : storageAccessTier
+
+var effectiveBookshelfIndexSize = empty(bookshelfIndexSize) ? preset.bookshelfIndexSize : bookshelfIndexSize
+var effectiveBookshelfPublicNetworkAccess = empty(bookshelfPublicNetworkAccess)
+  ? (networkIsolation ? 'Disabled' : 'Enabled')
+  : bookshelfPublicNetworkAccess
+var effectiveKnowledgeStorageAssetPath = empty(knowledgeStorageAssetPath)
+  ? '${knowledgeBlobContainerName}/'
+  : knowledgeStorageAssetPath
+
+// Sample tool used when the caller does not supply its own definitions. It runs
+// on the node pool created by this template and writes into the project's
+// storage container, so it works out of the box in both deployment modes.
+var defaultTools = [
+  {
+    name: 'dataset-summary'
+    version: '1.0.0'
+    definitionContent: {
+      tool_id: 'dataset-summary'
+      name: 'DatasetSummary'
+      description: 'Summarises tabular datasets (CSV/TSV) that were mounted into the tool container and writes a markdown report.'
+      actions: [
+        {
+          name: 'SummarizeDataset'
+          description: 'Reads every CSV/TSV file under the input mount (/app/inputs) and writes summary.md plus summary.json to the output mount (/app/outputs). Mount the dataset to /app/inputs and capture /app/outputs.'
+          input_schema: {
+            type: 'object'
+            properties: {
+              inputPath: {
+                type: 'string'
+                description: 'Absolute path inside the container that the dataset is mounted to. Defaults to /app/inputs.'
+              }
+              outputPath: {
+                type: 'string'
+                description: 'Absolute path inside the container that the report is written to. Defaults to /app/outputs.'
+              }
+              maxRows: {
+                type: 'string'
+                description: 'Maximum number of rows to read per file. Keep this small in CostOptimized deployments.'
+              }
+            }
+            required: [
+              'inputPath'
+            ]
+          }
+          command: 'python3 -m discovery_tools.dataset_summary'
+          environment_variables: [
+            {
+              name: 'INPUT_DIRECTORY_PATH'
+              value: '{{ inputPath }}'
+            }
+            {
+              name: 'OUTPUT_DIRECTORY_PATH'
+              value: '{{ outputPath }}'
+            }
+            {
+              name: 'MAX_ROWS'
+              value: '{{ maxRows }}'
+            }
+          ]
+        }
+      ]
+    }
+  }
+]
+
+var effectiveTools = empty(tools) ? defaultTools : tools
+
+// Environment variables handed to every tool so the tool command can adapt to
+// the deployment mode without hard-coding infrastructure details. The
+// parallelism hint tracks the node pool maximum, which is the cost-mode knob.
+var managedToolEnvironmentVariables = {
+  DISCOVERY_DEPLOYMENT_MODE: deploymentMode
+  DISCOVERY_NODE_POOL_NAME: nodePoolName
+  DISCOVERY_STORAGE_CONTAINER_NAME: storageContainerName
+  DISCOVERY_MAX_PARALLELISM: string(effectiveNodePoolMaxNodeCount)
+}
+
+var effectiveToolEnvironmentVariables = union(managedToolEnvironmentVariables, toolEnvironmentVariables)
 
 // Tags applied to every taggable resource created by this template.
 var commonTags = {
@@ -387,6 +562,19 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
           ]
         }
       }
+      {
+        // Left undelegated on purpose: the Bookshelf managed AI Search instance
+        // cannot join a subnet delegated to Microsoft.App/environments.
+        name: bookshelfSearchSubnetName
+        properties: {
+          addressPrefix: bookshelfSearchSubnetPrefix
+          serviceEndpoints: [
+            {
+              service: 'Microsoft.Storage'
+            }
+          ]
+        }
+      }
     ]
   }
 }
@@ -442,6 +630,10 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
           id: resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName, 'searchSubnet')
           action: 'Allow'
         }
+        {
+          id: resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName, bookshelfSearchSubnetName)
+          action: 'Allow'
+        }
       ]
     }
   }
@@ -481,6 +673,16 @@ resource blobServices 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01
 resource blobContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
   parent: blobServices
   name: blobContainerName
+  properties: {
+    publicAccess: 'None'
+  }
+}
+
+// Kept separate from the Discovery output container so that agent/tool results
+// never end up in the corpus that the Knowledge Base indexes.
+resource knowledgeBlobContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = if (deployBookshelf) {
+  parent: blobServices
+  name: knowledgeBlobContainerName
   properties: {
     publicAccess: 'None'
   }
@@ -650,6 +852,99 @@ resource project 'Microsoft.Discovery/workspaces/projects@2026-06-01' = {
   }
 }
 
+// -----------------------------------------------------------------------------
+// Bookshelf stack (optional, controlled by deployBookshelf)
+// -----------------------------------------------------------------------------
+
+// Dedicated identity so the Bookshelf's blob access can be revoked without
+// touching the Supercomputer/Workspace identity.
+resource bookshelfIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' = if (deployBookshelf) {
+  name: bookshelfIdentityName
+  location: location
+  tags: commonTags
+  properties: {
+    isolationScope: 'Regional'
+  }
+}
+
+resource bookshelfStorageBlobDataContributorAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (deployBookshelf) {
+  name: guid(storageAccount.id, bookshelfIdentityName, storageBlobDataContributorRoleId)
+  scope: storageAccount
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataContributorRoleId)
+    principalId: bookshelfIdentity!.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource bookshelf 'Microsoft.Discovery/bookshelves@2026-06-01' = if (deployBookshelf) {
+  name: bookshelfName
+  location: location
+  tags: union(commonTags, {
+    indexSize: effectiveBookshelfIndexSize
+  })
+  dependsOn: [
+    vnet
+    // Roles must exist before the control plane configures NSP.
+    discoveryControlPlaneRoles
+  ]
+  properties: {
+    customerManagedKeys: 'Disabled'
+    publicNetworkAccess: effectiveBookshelfPublicNetworkAccess
+    privateEndpointSubnetId: resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName, 'privateEndpointSubnet')
+    searchSubnetId: resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName, bookshelfSearchSubnetName)
+    workloadIdentities: {
+      '${bookshelfIdentity!.id}': {}
+    }
+  }
+}
+
+resource knowledgeStorageContainer 'Microsoft.Discovery/storageContainers@2026-06-01' = if (deployBookshelf) {
+  name: knowledgeStorageContainerName
+  location: location
+  tags: commonTags
+  dependsOn: [
+    knowledgeBlobContainer
+    discoveryControlPlaneRoles
+  ]
+  properties: {
+    storageStore: {
+      kind: 'AzureStorageBlob'
+      storageAccountId: storageAccount.id
+    }
+  }
+}
+
+resource knowledgeStorageAsset 'Microsoft.Discovery/storageContainers/storageAssets@2026-06-01' = if (deployBookshelf) {
+  parent: knowledgeStorageContainer
+  name: knowledgeStorageAssetName
+  location: location
+  tags: commonTags
+  properties: {
+    description: knowledgeStorageAssetDescription
+    path: effectiveKnowledgeStorageAssetPath
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Discovery Tools (optional, controlled by deployTools)
+// -----------------------------------------------------------------------------
+resource discoveryTools 'Microsoft.Discovery/tools@2026-06-01' = [
+  for tool in (deployTools ? effectiveTools : []): {
+    name: tool.name
+    location: location
+    tags: commonTags
+    dependsOn: [
+      discoveryControlPlaneRoles
+    ]
+    properties: {
+      version: tool.version
+      definitionContent: tool.definitionContent
+      environmentVariables: union(effectiveToolEnvironmentVariables, tool.?environmentVariables ?? {})
+    }
+  }
+]
+
 @description('Resource ID of the Supercomputer.')
 output supercomputerId string = supercomputer.id
 
@@ -677,6 +972,27 @@ output storageAccountId string = storageAccount.id
 @description('Resource ID of the Virtual Network.')
 output vnetId string = vnet.id
 
+@description('Resource ID of the Bookshelf, or empty when deployBookshelf is false.')
+output bookshelfId string = deployBookshelf ? bookshelf!.id : ''
+
+@description('Data-plane endpoint of the Bookshelf, or empty when deployBookshelf is false.')
+output bookshelfEndpoint string = deployBookshelf ? 'https://${bookshelfName}.bookshelf.discovery.azure.com' : ''
+
+@description('Resource ID of the Bookshelf workload identity. Select this identity in the Create knowledge base wizard.')
+output bookshelfIdentityId string = deployBookshelf ? bookshelfIdentity!.id : ''
+
+@description('Resource ID of the Discovery Storage Container that exposes the knowledge documents.')
+output knowledgeStorageContainerId string = deployBookshelf ? knowledgeStorageContainer!.id : ''
+
+@description('Resource ID of the Storage Asset to select in the Create knowledge base wizard.')
+output knowledgeStorageAssetId string = deployBookshelf ? knowledgeStorageAsset!.id : ''
+
+@description('Blob container that the Knowledge Base indexes. Upload the source documents here.')
+output knowledgeBlobContainer string = deployBookshelf ? knowledgeBlobContainerName : ''
+
+@description('Names of the deployed Microsoft.Discovery/tools resources.')
+output toolNames array = [for tool in (deployTools ? effectiveTools : []): tool.name]
+
 @description('Cost preset applied to this deployment.')
 output deploymentModeApplied string = deploymentMode
 
@@ -690,4 +1006,9 @@ output effectiveCostSettings object = {
   supercomputerSystemSku: effectiveSupercomputerSystemSku
   storageAccountSku: effectiveStorageAccountSku
   storageAccessTier: effectiveStorageAccessTier
+  bookshelfDeployed: deployBookshelf
+  bookshelfIndexSize: deployBookshelf ? effectiveBookshelfIndexSize : 'n/a'
+  bookshelfPublicNetworkAccess: deployBookshelf ? effectiveBookshelfPublicNetworkAccess : 'n/a'
+  toolsDeployed: deployTools ? length(effectiveTools) : 0
+  toolMaxParallelism: string(effectiveNodePoolMaxNodeCount)
 }
