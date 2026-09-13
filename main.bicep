@@ -1,3 +1,20 @@
+// -----------------------------------------------------------------------------
+// Deployment mode (cost preset)
+//
+// A single switch that flips every cost-relevant parameter at once:
+//   CostOptimized (default) - minimum running cost for PoC / dev / demo.
+//   Production              - the original, resiliency-oriented settings.
+//
+// Every value in the preset can still be overridden individually by passing the
+// matching parameter explicitly (see the "mode overrides" section below).
+// -----------------------------------------------------------------------------
+@description('Cost preset applied to all cost-relevant parameters. CostOptimized minimises running cost (scale-to-zero, Spot nodes, locally-redundant storage); Production restores the resiliency-oriented defaults.')
+@allowed([
+  'CostOptimized'
+  'Production'
+])
+param deploymentMode string = 'CostOptimized'
+
 @description('Azure region for all resources. Must be a Discovery-supported region.')
 @allowed([
   'eastus'
@@ -52,15 +69,25 @@ param storageAccountName string = 'stg${uniqueString(resourceGroup().id)}'
 @description('Name of the blob container inside the Storage Account used for Discovery outputs.')
 param blobContainerName string = 'discoveryoutputs'
 
-@description('Replication SKU for the Storage Account. Zone/geo-redundant options are recommended over locally-redundant storage for resiliency.')
+@description('Replication SKU for the Storage Account. Leave empty to use the deploymentMode preset (CostOptimized: Standard_LRS, Production: Standard_GRS).')
 @allowed([
+  ''
+  'Standard_LRS'
   'Standard_ZRS'
   'Standard_GRS'
   'Standard_GZRS'
   'Standard_RAGRS'
   'Standard_RAGZRS'
 ])
-param storageAccountSku string = 'Standard_GRS'
+param storageAccountSku string = ''
+
+@description('Access tier for the Storage Account. Leave empty to use the deploymentMode preset (CostOptimized: Cool, Production: Hot).')
+@allowed([
+  ''
+  'Hot'
+  'Cool'
+])
+param storageAccessTier string = ''
 
 @description('Address space for the Virtual Network.')
 param vnetAddressPrefix string = '10.0.0.0/16'
@@ -83,23 +110,38 @@ param agentSubnetPrefix string = '10.0.5.0/24'
 @description('Address prefix for Search Subnet.')
 param searchSubnetPrefix string = '10.0.6.0/24'
 
-@description('VM SKU for the Node Pool.')
-param nodePoolVmSize string = 'Standard_D4s_v6'
+@description('VM SKU for the Node Pool. Leave empty to use the deploymentMode preset (Standard_D4s_v6 in both modes).')
+param nodePoolVmSize string = ''
 
-@description('Maximum number of nodes in the Node Pool.')
-@minValue(1)
-param nodePoolMaxNodeCount int = 3
+@description('Maximum number of nodes in the Node Pool. Use -1 to apply the deploymentMode preset (CostOptimized: 1, Production: 3).')
+@minValue(-1)
+param nodePoolMaxNodeCount int = -1
 
-@description('Minimum number of nodes in the Node Pool (0 allows scale-to-zero).')
-@minValue(0)
-param nodePoolMinNodeCount int = 0
+@description('Minimum number of nodes in the Node Pool (0 allows scale-to-zero). Use -1 to apply the deploymentMode preset (0 in both modes).')
+@minValue(-1)
+param nodePoolMinNodeCount int = -1
 
-@description('Scale set priority for the Node Pool.')
+@description('Scale set priority for the Node Pool. Leave empty to use the deploymentMode preset (CostOptimized: Spot, Production: Regular).')
 @allowed([
+  ''
   'Regular'
   'Spot'
 ])
-param nodePoolScaleSetPriority string = 'Regular'
+param nodePoolScaleSetPriority string = ''
+
+@description('OS disk size (GB) for the Node Pool nodes. Use -1 to apply the deploymentMode preset (CostOptimized: 64, Production: 120).')
+@minValue(-1)
+@maxValue(2048)
+param nodePoolOsDiskSizeGb int = -1
+
+@description('VM SKU of the AKS system node pool managed by the Supercomputer. Leave empty to use the deploymentMode preset (Standard_D4s_v6 in both modes).')
+@allowed([
+  ''
+  'Standard_D4s_v4'
+  'Standard_D4s_v5'
+  'Standard_D4s_v6'
+])
+param supercomputerSystemSku string = ''
 
 @description('Chat model format.')
 param chatModelFormat string = 'OpenAI'
@@ -168,6 +210,60 @@ param workspaceAdminPrincipalIds array = []
 ])
 param workspaceAdminPrincipalType string = 'User'
 
+// -----------------------------------------------------------------------------
+// Cost presets
+//
+// modePresets holds one parameter set per deploymentMode. Changing the single
+// `deploymentMode` parameter flips every value below at once. Any individual
+// parameter that is explicitly supplied (non-empty string / non-negative int)
+// wins over the preset.
+// -----------------------------------------------------------------------------
+var modePresets = {
+  CostOptimized: {
+    // Node pool: scale-to-zero, a single Spot node at most and a small OS disk.
+    nodePoolVmSize: 'Standard_D4s_v6'
+    nodePoolMaxNodeCount: 1
+    nodePoolMinNodeCount: 0
+    nodePoolScaleSetPriority: 'Spot'
+    nodePoolOsDiskSizeGb: 64
+    // AKS system node pool managed by the Supercomputer (smallest supported SKU).
+    supercomputerSystemSku: 'Standard_D4s_v6'
+    // Storage: locally-redundant + cool tier is the cheapest durable option.
+    storageAccountSku: 'Standard_LRS'
+    storageAccessTier: 'Cool'
+  }
+  Production: {
+    nodePoolVmSize: 'Standard_D4s_v6'
+    nodePoolMaxNodeCount: 3
+    nodePoolMinNodeCount: 0
+    nodePoolScaleSetPriority: 'Regular'
+    nodePoolOsDiskSizeGb: 120
+    supercomputerSystemSku: 'Standard_D4s_v6'
+    storageAccountSku: 'Standard_GRS'
+    storageAccessTier: 'Hot'
+  }
+}
+
+var preset = modePresets[deploymentMode]
+
+var effectiveNodePoolVmSize = empty(nodePoolVmSize) ? preset.nodePoolVmSize : nodePoolVmSize
+var effectiveNodePoolMaxNodeCount = nodePoolMaxNodeCount < 0 ? preset.nodePoolMaxNodeCount : nodePoolMaxNodeCount
+var effectiveNodePoolMinNodeCount = nodePoolMinNodeCount < 0 ? preset.nodePoolMinNodeCount : nodePoolMinNodeCount
+var effectiveNodePoolScaleSetPriority = empty(nodePoolScaleSetPriority)
+  ? preset.nodePoolScaleSetPriority
+  : nodePoolScaleSetPriority
+var effectiveNodePoolOsDiskSizeGb = nodePoolOsDiskSizeGb < 0 ? preset.nodePoolOsDiskSizeGb : nodePoolOsDiskSizeGb
+var effectiveSupercomputerSystemSku = empty(supercomputerSystemSku)
+  ? preset.supercomputerSystemSku
+  : supercomputerSystemSku
+var effectiveStorageAccountSku = empty(storageAccountSku) ? preset.storageAccountSku : storageAccountSku
+var effectiveStorageAccessTier = empty(storageAccessTier) ? preset.storageAccessTier : storageAccessTier
+
+// Tags applied to every taggable resource created by this template.
+var commonTags = {
+  SecurityControl: 'Ignore'
+}
+
 // Built-in role definition IDs
 var storageBlobDataContributorRoleId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
 var discoveryPlatformContributorRoleId = '01288891-85ee-45a7-b367-9db3b752fc65'
@@ -196,6 +292,7 @@ module discoveryControlPlaneRoles 'subscription-roles.bicep' = {
 resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
   name: vnetName
   location: location
+  tags: commonTags
   properties: {
     addressSpace: {
       addressPrefixes: [
@@ -295,6 +392,7 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
 resource managedIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' = {
   name: managedIdentityName
   location: location
+  tags: commonTags
   properties: {
     isolationScope: 'Regional'
   }
@@ -303,15 +401,16 @@ resource managedIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-
 resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: storageAccountName
   location: location
+  tags: commonTags
   kind: 'StorageV2'
   sku: {
-    name: storageAccountSku
+    name: effectiveStorageAccountSku
   }
   dependsOn: [
     vnet
   ]
   properties: {
-    accessTier: 'Hot'
+    accessTier: effectiveStorageAccessTier
     allowBlobPublicAccess: false
     allowSharedKeyAccess: false
     minimumTlsVersion: 'TLS1_2'
@@ -436,9 +535,9 @@ resource discoveryStudioAdminAssignments 'Microsoft.Authorization/roleAssignment
 resource supercomputer 'Microsoft.Discovery/supercomputers@2026-06-01' = {
   name: supercomputerName
   location: location
-  tags: {
+  tags: union(commonTags, {
     version: 'v2'
-  }
+  })
   dependsOn: [
     vnet
     // Roles must exist before the control plane configures NSP.
@@ -446,6 +545,7 @@ resource supercomputer 'Microsoft.Discovery/supercomputers@2026-06-01' = {
   ]
   properties: {
     subnetId: resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName, 'aksSubnet')
+    systemSku: effectiveSupercomputerSystemSku
     identities: {
       clusterIdentity: {
         id: managedIdentity.id
@@ -464,27 +564,29 @@ resource nodePool 'Microsoft.Discovery/supercomputers/nodePools@2026-06-01' = {
   parent: supercomputer
   name: nodePoolName
   location: location
+  tags: commonTags
   dependsOn: [
     vnet
   ]
   properties: {
     subnetId: resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName, 'supercomputerNodepoolSubnet')
-    vmSize: nodePoolVmSize
-    maxNodeCount: nodePoolMaxNodeCount
-    minNodeCount: nodePoolMinNodeCount
-    scaleSetPriority: nodePoolScaleSetPriority
+    vmSize: effectiveNodePoolVmSize
+    maxNodeCount: effectiveNodePoolMaxNodeCount
+    minNodeCount: effectiveNodePoolMinNodeCount
+    scaleSetPriority: effectiveNodePoolScaleSetPriority
+    osDiskSizeGb: effectiveNodePoolOsDiskSizeGb
   }
 }
 
 resource workspace 'Microsoft.Discovery/workspaces@2026-06-01' = {
   name: workspaceName
   location: location
-  tags: {
+  tags: union(commonTags, {
     version: 'v2'
     'discovery.workbench.enableGhcpAiFeatures': string(enableGhcpAiFeatures)
     'discovery.workbench.enableExtensions': string(enableExtensions)
     NetworkIsolation: string(networkIsolation)
-  }
+  })
   dependsOn: [
     vnet
     nodePool
@@ -508,6 +610,7 @@ resource chatModelDeployment 'Microsoft.Discovery/workspaces/chatModelDeployment
   parent: workspace
   name: chatModelDeploymentName
   location: location
+  tags: commonTags
   properties: {
     modelFormat: chatModelFormat
     modelName: chatModelName
@@ -517,6 +620,7 @@ resource chatModelDeployment 'Microsoft.Discovery/workspaces/chatModelDeployment
 resource discoveryStorageContainer 'Microsoft.Discovery/storageContainers@2026-06-01' = {
   name: storageContainerName
   location: location
+  tags: commonTags
   dependsOn: [
     // Roles must exist before the control plane configures NSP.
     discoveryControlPlaneRoles
@@ -533,6 +637,7 @@ resource project 'Microsoft.Discovery/workspaces/projects@2026-06-01' = {
   parent: workspace
   name: projectName
   location: location
+  tags: commonTags
   dependsOn: [
     chatModelDeployment
   ]
@@ -569,3 +674,18 @@ output storageAccountId string = storageAccount.id
 
 @description('Resource ID of the Virtual Network.')
 output vnetId string = vnet.id
+
+@description('Cost preset applied to this deployment.')
+output deploymentModeApplied string = deploymentMode
+
+@description('Cost-relevant settings actually applied (after preset + explicit overrides).')
+output effectiveCostSettings object = {
+  nodePoolVmSize: effectiveNodePoolVmSize
+  nodePoolMaxNodeCount: effectiveNodePoolMaxNodeCount
+  nodePoolMinNodeCount: effectiveNodePoolMinNodeCount
+  nodePoolScaleSetPriority: effectiveNodePoolScaleSetPriority
+  nodePoolOsDiskSizeGb: effectiveNodePoolOsDiskSizeGb
+  supercomputerSystemSku: effectiveSupercomputerSystemSku
+  storageAccountSku: effectiveStorageAccountSku
+  storageAccessTier: effectiveStorageAccessTier
+}

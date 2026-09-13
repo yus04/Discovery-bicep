@@ -7,6 +7,7 @@
 #   ./deploy.sh                  # 既定値 (swedencentral / discoveryRG) でデプロイ
 #   LOCATION=eastus ./deploy.sh  # リージョンを変更 (対応: eastus/uksouth/swedencentral)
 #   RG=myDiscoveryRG ./deploy.sh # リソースグループ名を変更
+#   DEPLOYMENT_MODE=Production ./deploy.sh # 本番モード (既定: CostOptimized)
 #
 set -euo pipefail
 
@@ -17,6 +18,8 @@ LOCATION="${LOCATION:-swedencentral}"
 RG="${RG:-discoveryRG}"
 DEPLOYMENT_NAME="${DEPLOYMENT_NAME:-discovery-$(date +%Y%m%d-%H%M%S)}"
 TEMPLATE_FILE="${TEMPLATE_FILE:-main.bicep}"
+# コストプリセット: CostOptimized (既定) = ランニングコスト最小構成 / Production = 従来設定
+DEPLOYMENT_MODE="${DEPLOYMENT_MODE:-CostOptimized}"
 
 # az CLI のテレメトリ収集を無効化 (環境によってはクラッシュ回避のため必須)
 export AZURE_CORE_COLLECT_TELEMETRY=0
@@ -27,6 +30,7 @@ echo "   リージョン        : ${LOCATION}"
 echo "   リソースグループ  : ${RG}"
 echo "   デプロイ名        : ${DEPLOYMENT_NAME}"
 echo "   テンプレート      : ${TEMPLATE_FILE}"
+echo "   コストモード      : ${DEPLOYMENT_MODE}"
 echo "=================================================="
 
 # ------------------------------------------------------------------
@@ -71,7 +75,7 @@ echo "[4/5] テンプレートを検証 (what-if 省略, validate のみ)..."
 az deployment group validate \
   --resource-group "${RG}" \
   --template-file "${TEMPLATE_FILE}" \
-  --parameters location="${LOCATION}" \
+  --parameters location="${LOCATION}" deploymentMode="${DEPLOYMENT_MODE}" \
   --only-show-errors -o none
 echo "      検証 OK"
 
@@ -83,8 +87,8 @@ az deployment group create \
   --resource-group "${RG}" \
   --name "${DEPLOYMENT_NAME}" \
   --template-file "${TEMPLATE_FILE}" \
-  --parameters location="${LOCATION}" \
-  --query "{state:properties.provisioningState, ws:properties.outputs.workspaceId.value}" \
+  --parameters location="${LOCATION}" deploymentMode="${DEPLOYMENT_MODE}" \
+  --query "{state:properties.provisioningState, ws:properties.outputs.workspaceId.value, mode:properties.outputs.deploymentModeApplied.value}" \
   -o json
 
 echo "=================================================="

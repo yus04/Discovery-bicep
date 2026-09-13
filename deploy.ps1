@@ -17,6 +17,10 @@
 .EXAMPLE
     ./deploy.ps1 -ResourceGroup myDiscoveryRG
     リソースグループ名を変更
+
+.EXAMPLE
+    ./deploy.ps1 -DeploymentMode Production
+    本番モード (現状踏襲の設定値) でデプロイ。既定はコスト最適化モード
 #>
 [CmdletBinding()]
 param(
@@ -34,7 +38,12 @@ param(
     [string[]]$WorkspaceAdmins = @(),
 
     [ValidateSet('User','Group','ServicePrincipal')]
-    [string]$WorkspaceAdminType = 'User'
+    [string]$WorkspaceAdminType = 'User',
+
+    # コストプリセット。CostOptimized (既定) = ランニングコスト最小構成 /
+    # Production = 冗長性重視の従来設定
+    [ValidateSet('CostOptimized','Production')]
+    [string]$DeploymentMode = $(if ($env:DEPLOYMENT_MODE) { $env:DEPLOYMENT_MODE } else { 'CostOptimized' })
 )
 
 $ErrorActionPreference = 'Stop'
@@ -48,6 +57,7 @@ Write-Host "   リージョン        : $Location"
 Write-Host "   リソースグループ  : $ResourceGroup"
 Write-Host "   デプロイ名        : $DeploymentName"
 Write-Host "   テンプレート      : $TemplateFile"
+Write-Host "   コストモード      : $DeploymentMode"
 Write-Host '=================================================='
 
 # ------------------------------------------------------------------
@@ -137,6 +147,7 @@ az deployment group validate `
     --resource-group $ResourceGroup `
     --template-file $TemplateFile `
     --parameters location=$Location `
+                 deploymentMode=$DeploymentMode `
                  discoveryControlPlanePrincipalId=$discoveryPrincipalId `
                  workspaceAdminPrincipalIds=$adminsJson `
                  workspaceAdminPrincipalType=$WorkspaceAdminType `
@@ -157,10 +168,11 @@ az deployment group create `
     --name $DeploymentName `
     --template-file $TemplateFile `
     --parameters location=$Location `
+                 deploymentMode=$DeploymentMode `
                  discoveryControlPlanePrincipalId=$discoveryPrincipalId `
                  workspaceAdminPrincipalIds=$adminsJson `
                  workspaceAdminPrincipalType=$WorkspaceAdminType `
-    --query "{state:properties.provisioningState, ws:properties.outputs.workspaceId.value}" `
+    --query "{state:properties.provisioningState, ws:properties.outputs.workspaceId.value, mode:properties.outputs.deploymentModeApplied.value}" `
     -o json
 if ($LASTEXITCODE -ne 0) { throw 'デプロイに失敗しました。' }
 
