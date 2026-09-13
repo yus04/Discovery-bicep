@@ -6,7 +6,8 @@
 //   Production              - the original, resiliency-oriented settings.
 //
 // Every value in the preset can still be overridden individually by passing the
-// matching parameter explicitly (see the "mode overrides" section below).
+// matching parameter explicitly ('' for strings, -1 for integers means "use the
+// preset value").
 // -----------------------------------------------------------------------------
 @description('Cost preset applied to all cost-relevant parameters. CostOptimized minimises running cost (scale-to-zero, Spot nodes, locally-redundant storage); Production restores the resiliency-oriented defaults.')
 @allowed([
@@ -226,7 +227,8 @@ var modePresets = {
     nodePoolMinNodeCount: 0
     nodePoolScaleSetPriority: 'Spot'
     nodePoolOsDiskSizeGb: 64
-    // AKS system node pool managed by the Supercomputer (smallest supported SKU).
+    // AKS system node pool managed by the Supercomputer. Discovery only accepts
+    // Standard_D4s_v4 / v5 / v6 (all 4 vCPU), so there is no cheaper option.
     supercomputerSystemSku: 'Standard_D4s_v6'
     // Storage: locally-redundant + cool tier is the cheapest durable option.
     storageAccountSku: 'Standard_LRS'

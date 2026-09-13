@@ -32,9 +32,13 @@ Bicep を使って Microsoft Discovery のインフラ一式を Azure にデプ�
 
 | パラメーター | 既定値 | 説明 |
 | --- | --- | --- |
+| `deploymentMode` | `CostOptimized` | **コストモード**。`CostOptimized` (既定) / `Production` の 2 つのパラメーターセットを一括切替。詳細は [1-1. コストモード](#1-1-コストモードdeploymentmode) |
 | `location` | `swedencentral` | デプロイ先リージョン (`eastus` / `swedencentral` / `uksouth`) |
 | `vnetName` | `discovery-vnet` | 仮想ネットワーク名 (2-64 文字) |
-| `storageAccountSku` | `Standard_GRS` | ストレージの冗長性。`Standard_ZRS` / `Standard_GRS` / `Standard_GZRS` / `Standard_RAGRS` / `Standard_RAGZRS` から選択 |
+| `storageAccountSku` | `''` (モード既定) | ストレージの冗長性。`Standard_LRS` / `Standard_ZRS` / `Standard_GRS` / `Standard_GZRS` / `Standard_RAGRS` / `Standard_RAGZRS`。空文字のときはモードの既定値 |
+| `storageAccessTier` | `''` (モード既定) | ストレージのアクセス層 (`Hot` / `Cool`)。空文字のときはモードの既定値 |
+| `nodePoolVmSize` / `nodePoolMaxNodeCount` / `nodePoolMinNodeCount` / `nodePoolScaleSetPriority` / `nodePoolOsDiskSizeGb` | `''` / `-1` (モード既定) | ノードプールの VM サイズ・最大/最小ノード数・優先度・OS ディスクサイズ。空文字または `-1` のときはモードの既定値 |
+| `supercomputerSystemSku` | `''` (モード既定) | スパコンが内部に作る AKS システムノードプールの VM SKU (`Standard_D4s_v4` / `v5` / `v6`) |
 | `chatModelName` / `chatModelDeploymentName` | `gpt-5.4` / `gpt-5-4` | デプロイするチャットモデルとそのリソース名 |
 | `enableGhcpAiFeatures` | `true` | Workspace の `discovery.workbench.enableGhcpAiFeatures` タグ。GitHub Copilot / AI 機能の有効化 |
 | `enableExtensions` | `true` | Workspace の `discovery.workbench.enableExtensions` タグ。VS Code 拡張機能マーケットプレースの有効化 |
@@ -45,6 +49,92 @@ Bicep を使って Microsoft Discovery のインフラ一式を Azure にデプ�
 > ⚠️ **`networkIsolation`**: 既定は `true` ですが、Discovery Studio のワークベンチは現時点で `false` のときのみ接続できます。パブリックプレビューのワークベンチにアクセスしたい場合は `-Parameters networkIsolation=false` を指定してください。
 
 > 📌 **ストレージのネットワーク設定**: `networkAcls.defaultAction` は意図的に `Allow` です。`Microsoft.Discovery` コントロールプレーンが Azure Storage の信頼されたサービスバイパス一覧に未対応で、`Deny` にすると Discovery リソースのプロビジョニングが失敗するためです。デプロイした 5 サブネット (privateEndpointSubnet 以外) の `virtualNetworkRules` は事前設定済みで、Discovery が対応次第 `Deny` に切り替えられます。
+
+---
+
+## 1-1. コストモード（`deploymentMode`）
+
+本テンプレートは **変数 1 つ (`deploymentMode`) を変えるだけ** で、コストに関わるパラメーター群をまとめて切り替えられます。既定は **コスト最適化モード (`CostOptimized`)** です。
+
+| モード | 想定用途 |
+| --- | --- |
+| `CostOptimized` (**既定**) | PoC / 検証 / デモ。使っていない時間帯のランニングコストを最小化 |
+| `Production` | 本番想定。可用性・冗長性・スループットを優先した従来どおりの設定値 |
+
+### モードごとのパラメーターセット
+
+`main.bicep` の `modePresets` 変数が実体です。
+
+| 設定項目 | `CostOptimized` | `Production` | コストへの効き方 |
+| --- | --- | --- | --- |
+| `nodePoolMinNodeCount` (ノードプール最小ノード数) | `0` | `0` | 未使用時はノード 0 台までスケールイン (ゼロスケール) |
+| `nodePoolMaxNodeCount` (最大ノード数) | `1` | `3` | 同時に起動しうる VM 台数の上限 = コスト上限 |
+| `nodePoolScaleSetPriority` (VMSS 優先度) | `Spot` | `Regular` | Spot は従量課金比で最大 8〜9 割引 (退避あり) |
+| `nodePoolOsDiskSizeGb` (OS ディスク) | `64` | `120` | ノード 1 台あたりのマネージドディスク料金を削減 |
+| `nodePoolVmSize` | `Standard_D4s_v6` | `Standard_D4s_v6` | 実処理に必要な最小サイズ。用途に応じて個別上書き可 |
+| `supercomputerSystemSku` (AKS システムノードプール SKU) | `Standard_D4s_v6` | `Standard_D4s_v6` | Discovery が許可する SKU は `Standard_D4s_v4/v5/v6` の 3 つのみ (いずれも 4 vCPU) |
+| `storageAccountSku` (ストレージ冗長性) | `Standard_LRS` | `Standard_GRS` | LRS は GRS の約半額 (地理冗長なし) |
+| `storageAccessTier` (アクセス層) | `Cool` | `Hot` | 保存容量単価が下がる (読み書きトランザクション単価は上がる) |
+
+### モードの切り替え方
+
+```bash
+# コスト最適化モード (既定) — 何も指定しなければこちら
+./deploy.sh
+
+# 本番モードへ切り替え
+DEPLOYMENT_MODE=Production ./deploy.sh
+```
+
+```powershell
+# コスト最適化モード (既定)
+./deploy.ps1
+
+# 本番モードへ切り替え
+./deploy.ps1 -DeploymentMode Production
+```
+
+```bash
+# az CLI を直接使う場合
+az deployment group create -g discoveryRG --template-file main.bicep \
+  --parameters deploymentMode=Production
+```
+
+デプロイ結果には適用されたモードと実効値が出力されます (`deploymentModeApplied` / `effectiveCostSettings`)。
+
+```bash
+az deployment group show -g discoveryRG -n <デプロイ名> \
+  --query "properties.outputs.effectiveCostSettings.value" -o json
+```
+
+### 個別のパラメーター上書き
+
+モードはあくまで既定値の束です。個別のパラメーターを明示的に渡すと、そのパラメーターだけモード値より優先されます (文字列は空文字 `''`、数値は `-1` が「モード既定を使う」の意味)。
+
+```bash
+# コスト最適化モードのまま、ノードプールだけ Regular 優先度に戻す
+az deployment group create -g discoveryRG --template-file main.bicep \
+  --parameters deploymentMode=CostOptimized nodePoolScaleSetPriority=Regular
+```
+
+> ⚠️ `Spot` ノードは Azure 側の都合で **退避 (eviction)** される可能性があります。長時間の計算ジョブを走らせる場合は `nodePoolScaleSetPriority=Regular` を指定するか `Production` モードを使ってください。
+>
+> ⚠️ モードを変えて再デプロイする際、`nodePoolVmSize` / `scaleSetPriority` / `osDiskSizeGb` / `systemSku` / ストレージ冗長性は **作成時のみ指定可能 (immutable)** なプロパティです。既存環境で値を変えたい場合は該当リソース (ノードプール / スパコン / ストレージ) の作り直しが必要です。
+
+### Discovery が自動作成するマネージドリソースについて
+
+Workspace / Supercomputer を作ると、Discovery コントロールプレーンが **管理用リソースグループ (`mrg-...`)** に Azure Container Apps 環境・Cosmos DB・AI Search・AKS クラスターなどを自動生成します。これらは `Microsoft.Discovery` の ARM API (`2026-06-01`) に設定項目が公開されていないため、**Bicep からは SKU やスケール設定を指定できません**。本テンプレートのコストモードが直接制御できるのは上表の範囲です。
+
+管理用 RG 側をさらに絞りたい場合は、デプロイ後に以下のような設定変更が候補になります (Microsoft のサポート対象外の操作になり得るため、検証環境での自己責任での実施を推奨)。
+
+| マネージドリソース | コスト最適化の方向性 | 備考 |
+| --- | --- | --- |
+| Azure Container Apps | 従量課金 (Consumption) ワークロードプロファイルのみにし、各アプリの最小レプリカ数を `0` にする | Dedicated (D シリーズ) プロファイルは常時課金。ゼロスケール時はコールドスタートが発生 |
+| Azure Cosmos DB | サーバーレスモードを利用する | プロビジョニング済みスループットからサーバーレスへの**インプレース変更は不可**。作り直しが必要 |
+| AKS (スパコン内部) | クラスター SKU を `Free` にする / システムノードプールを 1 台に減らす | Free は SLA なし・可用性が下がるため、本番用途では `Standard` を維持 |
+| Azure AI Search | **Basic プランのまま**で変更しない | 本プロジェクトでは最適化対象外 |
+
+> 💡 いずれも Discovery のバージョンアップや再プロビジョニングで **元の設定に戻る可能性** があります。恒久的なコスト削減としては「使わないときは RG ごと削除する」(6. クリーンアップ参照) が最も確実です。
 
 ---
 
@@ -132,6 +222,7 @@ az account set --subscription "<サブスクリプションID>"
 | `-TemplateFile` / `TEMPLATE_FILE` | `main.bicep` | 使用する Bicep テンプレート |
 | `-WorkspaceAdmins` | `@()` → **サインインユーザーを自動追加** | Discovery Studio (データプレーン) の管理者にする Object ID の配列 |
 | `-WorkspaceAdminType` | `User` | `WorkspaceAdmins` の種別。`User` / `Group` / `ServicePrincipal` |
+| `-DeploymentMode` / `DEPLOYMENT_MODE` | `CostOptimized` | コストモード。`CostOptimized` / `Production` ([1-1. コストモード](#1-1-コストモードdeploymentmode)) |
 
 > ✅ **`-WorkspaceAdmins` を省略しても、スクリプトが `az ad signed-in-user show` でサインインユーザーの Object ID を自動取得し、Discovery Platform Administrator ロールを付与します。** デプロイ直後から Discovery Studio で Agent / Project 作成が可能です。
 >
@@ -169,12 +260,12 @@ az provider show --namespace Microsoft.Discovery --query registrationState -o ts
 # リソースグループ作成
 az group create --name discoveryRG --location swedencentral
 
-# デプロイ
+# デプロイ (deploymentMode を省略するとコスト最適化モード)
 az deployment group create \
   --resource-group discoveryRG \
   --name discovery-deploy \
   --template-file main.bicep \
-  --parameters location=swedencentral
+  --parameters location=swedencentral deploymentMode=CostOptimized
 ```
 
 ### デプロイ状況の確認
