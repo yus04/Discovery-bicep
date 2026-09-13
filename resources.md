@@ -52,6 +52,8 @@ Discovery の第1パーティ サービスプリンシパル (Discovery control-
 
 タグを持てるすべてのリソース (VNet / UAMI / ストレージアカウント / Discovery 各リソース) には `SecurityControl: Ignore` が付与されます。ロール割り当てと Blob サービス / コンテナーは ARM 上タグを持てないため対象外です。
 
+`CostOptimized` の場合、Discovery が自動生成するマネージドリソースグループ (`mrg-dwsp-*` / `mrg-dscmp-*`) 内の AKS / Container Apps / Cosmos DB / Log Analytics / ストレージについては、Bicep では制御できないためデプロイ後に `optimize-mrg.sh` (`optimize-mrg.ps1`) がベストエフォートで設定変更します。変更項目の一覧は [README 1-1](README.md#1-1-コストモードdeploymentmode) の表を参照。
+
 ## リソース関連図 (Mermaid)
 
 ```mermaid
