@@ -10,15 +10,15 @@
 |---|---|---|---|---|
 | 1 | `vnet` | `Microsoft.Network/virtualNetworks` | 2024-05-01 | 全リソースの基盤となる仮想ネットワーク。6 つのサブネットを含む。 |
 | 2 | `managedIdentity` | `Microsoft.ManagedIdentity/userAssignedIdentities` | 2024-11-30 | Supercomputer / Workspace / ロール割り当てで使用する User-Assigned Managed Identity。 |
-| 3 | `storageAccount` | `Microsoft.Storage/storageAccounts` | 2023-05-01 | Discovery の出力先ストレージアカウント (StorageV2 / `storageAccountSku` 既定 `Standard_GRS`)。`networkAcls` は `defaultAction: Allow` + 5 サブネットの `virtualNetworkRules` を設定。 |
+| 3 | `storageAccount` | `Microsoft.Storage/storageAccounts` | 2023-05-01 | Discovery の出力先ストレージアカウント (StorageV2 / 冗長性・アクセス層は `deploymentMode` のプリセット。CostOptimized: `Standard_LRS` + `Cool` / Production: `Standard_GRS` + `Hot`)。`networkAcls` は `defaultAction: Allow` + 5 サブネットの `virtualNetworkRules` を設定。 |
 | 4 | `blobServices` | `Microsoft.Storage/storageAccounts/blobServices` | 2023-05-01 | Blob サービス既定構成 (CORS 設定含む)。`storageAccount` の子。 |
 | 5 | `blobContainer` | `Microsoft.Storage/storageAccounts/blobServices/containers` | 2023-05-01 | Discovery 出力用 Blob コンテナー (`publicAccess: None`)。`blobServices` の子。 |
 | 6 | `storageBlobDataContributorAssignment` | `Microsoft.Authorization/roleAssignments` | 2022-04-01 | `managedIdentity` に対する Storage Blob Data Contributor ロール割り当て (スコープ: storageAccount)。 |
 | 7 | `discoveryPlatformContributorAssignment` | `Microsoft.Authorization/roleAssignments` | 2022-04-01 | `managedIdentity` に対する Discovery Platform Contributor ロール割り当て (スコープ: リソースグループ)。 |
 | 8 | `acrPullAssignment` | `Microsoft.Authorization/roleAssignments` | 2022-04-01 | `managedIdentity` に対する AcrPull ロール割り当て (スコープ: リソースグループ)。 |
 | 9 | `discoveryStudioAdminAssignments` | `Microsoft.Authorization/roleAssignments` | 2022-04-01 | `workspaceAdminPrincipalIds` に対する Discovery Platform Administrator ロール割り当て (スコープ: リソースグループ)。配列分ループ。Quickstart には無い独自拡張。 |
-| 10 | `supercomputer` | `Microsoft.Discovery/supercomputers` | 2026-06-01 | Microsoft Discovery Supercomputer。`aksSubnet` を利用。 |
-| 11 | `nodePool` | `Microsoft.Discovery/supercomputers/nodePools` | 2026-06-01 | Supercomputer 配下の Node Pool。`supercomputerNodepoolSubnet` を利用。 |
+| 10 | `supercomputer` | `Microsoft.Discovery/supercomputers` | 2026-06-01 | Microsoft Discovery Supercomputer。`aksSubnet` を利用。内部 AKS のシステムノードプール SKU は `systemSku` で指定 (`deploymentMode` プリセット)。 |
+| 11 | `nodePool` | `Microsoft.Discovery/supercomputers/nodePools` | 2026-06-01 | Supercomputer 配下の Node Pool。`supercomputerNodepoolSubnet` を利用。VM サイズ / 最大・最小ノード数 / 優先度 / OS ディスクサイズは `deploymentMode` プリセット (CostOptimized: 最大 1 台・Spot・64 GB / Production: 最大 3 台・Regular・120 GB)。いずれも最小ノード数 0 でゼロスケール。 |
 | 12 | `workspace` | `Microsoft.Discovery/workspaces` | 2026-06-01 | Discovery Workspace。Supercomputer と 3 サブネット (workspace / agent / privateEndpoint) を参照。タグで `discovery.workbench.enableGhcpAiFeatures` / `discovery.workbench.enableExtensions` / `NetworkIsolation` を制御。 |
 | 13 | `chatModelDeployment` | `Microsoft.Discovery/workspaces/chatModelDeployments` | 2026-06-01 | Workspace 配下のチャットモデルデプロイ (OpenAI 形式 / 既定 `gpt-5.4`)。 |
 | 14 | `discoveryStorageContainer` | `Microsoft.Discovery/storageContainers` | 2026-06-01 | Discovery のストレージコンテナー。`storageAccount` を Blob ストアとして参照。 |
@@ -45,6 +45,14 @@ Discovery の第1パーティ サービスプリンシパル (Discovery control-
 | `privateEndpointSubnet` | 10.0.4.0/24 | なし | なし | `workspace` (Private Endpoint) |
 | `agentSubnet` | 10.0.5.0/24 | `Microsoft.App/environments` | `Microsoft.Storage` | `workspace` (Agent) |
 | `searchSubnet` | 10.0.6.0/24 | `Microsoft.App/environments` | `Microsoft.Storage` | (予約: Search 用) |
+
+### コストモード (`deploymentMode`) とタグ
+
+`deploymentMode` (`CostOptimized` 既定 / `Production`) がコスト関連パラメーターを一括で切り替えます。対象は ノードプール (VM サイズ / 最大・最小ノード数 / 優先度 / OS ディスク)、スパコンのシステムノードプール SKU、ストレージの冗長性とアクセス層です。個別パラメーターを明示指定した場合はそちらが優先されます。詳細は [README 1-1](README.md#1-1-コストモードdeploymentmode) を参照。
+
+タグを持てるすべてのリソース (VNet / UAMI / ストレージアカウント / Discovery 各リソース) には `SecurityControl: Ignore` が付与されます。ロール割り当てと Blob サービス / コンテナーは ARM 上タグを持てないため対象外です。
+
+`CostOptimized` の場合、Discovery が自動生成するマネージドリソースグループ (`mrg-dwsp-*` / `mrg-dscmp-*`) 内の AKS / Container Apps / Cosmos DB / Log Analytics / ストレージについては、Bicep では制御できないためデプロイ後に `optimize-mrg.sh` (`optimize-mrg.ps1`) がベストエフォートで設定変更します。変更項目の一覧は [README 1-1](README.md#1-1-コストモードdeploymentmode) の表を参照。
 
 ## リソース関連図 (Mermaid)
 

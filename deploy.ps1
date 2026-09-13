@@ -17,6 +17,14 @@
 .EXAMPLE
     ./deploy.ps1 -ResourceGroup myDiscoveryRG
     リソースグループ名を変更
+
+.EXAMPLE
+    ./deploy.ps1 -DeploymentMode Production
+    本番モード (現状踏襲の設定値) でデプロイ。既定はコスト最適化モード
+
+.EXAMPLE
+    ./deploy.ps1 -SkipMrgOptimize
+    デプロイ後のマネージドリソースグループ最適化をスキップ
 #>
 [CmdletBinding()]
 param(
@@ -34,7 +42,15 @@ param(
     [string[]]$WorkspaceAdmins = @(),
 
     [ValidateSet('User','Group','ServicePrincipal')]
-    [string]$WorkspaceAdminType = 'User'
+    [string]$WorkspaceAdminType = 'User',
+
+    # コストプリセット。CostOptimized (既定) = ランニングコスト最小構成 /
+    # Production = 冗長性重視の従来設定
+    [ValidateSet('CostOptimized','Production')]
+    [string]$DeploymentMode = $(if ($env:DEPLOYMENT_MODE) { $env:DEPLOYMENT_MODE } else { 'CostOptimized' }),
+
+    # 指定すると、コスト最適化モードでもデプロイ後の MRG 最適化を実行しない
+    [switch]$SkipMrgOptimize
 )
 
 $ErrorActionPreference = 'Stop'
@@ -48,12 +64,13 @@ Write-Host "   リージョン        : $Location"
 Write-Host "   リソースグループ  : $ResourceGroup"
 Write-Host "   デプロイ名        : $DeploymentName"
 Write-Host "   テンプレート      : $TemplateFile"
+Write-Host "   コストモード      : $DeploymentMode"
 Write-Host '=================================================='
 
 # ------------------------------------------------------------------
 # 1. ログイン確認
 # ------------------------------------------------------------------
-Write-Host '[1/5] ログイン状態を確認...'
+Write-Host '[1/6] ログイン状態を確認...'
 $subId   = az account show --query id   -o tsv
 if ($LASTEXITCODE -ne 0) { throw 'az account show に失敗しました。az login を実行してください。' }
 $subName = az account show --query name -o tsv
@@ -77,7 +94,7 @@ if ($WorkspaceAdmins.Count -eq 0) {
 #    ※ Discovery はプレビューのため、登録が完了していないと
 #      "Cannot access Supercomputer" 等のエラーになり得る
 # ------------------------------------------------------------------
-Write-Host '[2/5] Microsoft.Discovery プロバイダーを登録...'
+Write-Host '[2/6] Microsoft.Discovery プロバイダーを登録...'
 az feature register --namespace Microsoft.Discovery --name DiscoveryEnabled --only-show-errors *> $null
 az provider register --namespace Microsoft.Discovery --only-show-errors *> $null
 if ($LASTEXITCODE -ne 0) { throw 'プロバイダー登録に失敗しました。' }
@@ -99,7 +116,7 @@ for ($i = 1; $i -le 30; $i++) {
 #     テナントに存在しない場合は作成し、Object ID を取得して Bicep に渡す
 #     Docs: https://learn.microsoft.com/en-us/azure/microsoft-discovery/how-to-configure-network-security?tabs=azure-cli#verify-the-service-principal
 # ------------------------------------------------------------------
-Write-Host '[2b/5] Discovery control-plane サービスプリンシパルを確認...'
+Write-Host '[2b/6] Discovery control-plane サービスプリンシパルを確認...'
 $discoveryAppId = '92c174ac-8e41-4815-a1b7-d81b19ab03ce'
 $discoveryPrincipalId = az ad sp show --id $discoveryAppId --query id -o tsv 2>$null
 if (-not $discoveryPrincipalId) {
@@ -114,7 +131,7 @@ Write-Host "      Discovery SP Object ID: $discoveryPrincipalId"
 # ------------------------------------------------------------------
 # 3. リソースグループ作成 (べき等)
 # ------------------------------------------------------------------
-Write-Host '[3/5] リソースグループを作成...'
+Write-Host '[3/6] リソースグループを作成...'
 az group create --name $ResourceGroup --location $Location --only-show-errors -o none
 if ($LASTEXITCODE -ne 0) { throw "リソースグループの作成に失敗しました: $ResourceGroup" }
 Write-Host "      OK: $ResourceGroup ($Location)"
@@ -122,7 +139,7 @@ Write-Host "      OK: $ResourceGroup ($Location)"
 # ------------------------------------------------------------------
 # 4. Bicep テンプレートの検証
 # ------------------------------------------------------------------
-Write-Host '[4/5] テンプレートを検証 (what-if 省略, validate のみ)...'
+Write-Host '[4/6] テンプレートを検証 (what-if 省略, validate のみ)...'
 
 # 配列パラメータは JSON リテラル ["id1","id2"] 形式で渡す (PS 5.1 互換)
 # ※ PowerShell → az.exe (Python launcher) はダブルクォートを剥がすため
@@ -137,6 +154,7 @@ az deployment group validate `
     --resource-group $ResourceGroup `
     --template-file $TemplateFile `
     --parameters location=$Location `
+                 deploymentMode=$DeploymentMode `
                  discoveryControlPlanePrincipalId=$discoveryPrincipalId `
                  workspaceAdminPrincipalIds=$adminsJson `
                  workspaceAdminPrincipalType=$WorkspaceAdminType `
@@ -151,18 +169,42 @@ Write-Host '      検証 OK'
 #      実行者は Subscription 上で Owner または User Access Administrator
 #      権限を持つ必要があります。
 # ------------------------------------------------------------------
-Write-Host '[5/5] デプロイ実行 (スパコン作成に20分以上かかる場合があります)...'
+Write-Host '[5/6] デプロイ実行 (スパコン作成に20分以上かかる場合があります)...'
 az deployment group create `
     --resource-group $ResourceGroup `
     --name $DeploymentName `
     --template-file $TemplateFile `
     --parameters location=$Location `
+                 deploymentMode=$DeploymentMode `
                  discoveryControlPlanePrincipalId=$discoveryPrincipalId `
                  workspaceAdminPrincipalIds=$adminsJson `
                  workspaceAdminPrincipalType=$WorkspaceAdminType `
-    --query "{state:properties.provisioningState, ws:properties.outputs.workspaceId.value}" `
+    --query "{state:properties.provisioningState, ws:properties.outputs.workspaceId.value, mode:properties.outputs.deploymentModeApplied.value}" `
     -o json
 if ($LASTEXITCODE -ne 0) { throw 'デプロイに失敗しました。' }
+
+# ------------------------------------------------------------------
+# 6. マネージドリソースグループ (MRG) のコスト最適化
+#    Discovery が自動生成する AKS / Container Apps / Cosmos DB などは
+#    Bicep から制御できないため、デプロイ後にスクリプトで最適化する。
+#    ベストエフォート方式のため、一部が失敗しても全体は継続する。
+# ------------------------------------------------------------------
+if ($DeploymentMode -eq 'CostOptimized' -and -not $SkipMrgOptimize) {
+    Write-Host '[6/6] マネージドリソースグループのコスト最適化...'
+    $optimizeScript = Join-Path $PSScriptRoot 'optimize-mrg.ps1'
+    if (Test-Path $optimizeScript) {
+        # 最適化の失敗でデプロイ全体を失敗扱いにしない
+        try {
+            & $optimizeScript -Apply -ResourceGroup $ResourceGroup
+        } catch {
+            Write-Warning "MRG 最適化中にエラーが発生しましたが処理を継続します: $_"
+        }
+    } else {
+        Write-Host '      optimize-mrg.ps1 が見つからないためスキップします。'
+    }
+} else {
+    Write-Host "[6/6] マネージドリソースグループの最適化はスキップします (mode=$DeploymentMode)。"
+}
 
 Write-Host '=================================================='
 Write-Host ' 完了。各リソースの状態は以下で確認できます:'

@@ -32,9 +32,13 @@ Bicep を使って Microsoft Discovery のインフラ一式を Azure にデプ�
 
 | パラメーター | 既定値 | 説明 |
 | --- | --- | --- |
+| `deploymentMode` | `CostOptimized` | **コストモード**。`CostOptimized` (既定) / `Production` の 2 つのパラメーターセットを一括切替。詳細は [1-1. コストモード](#1-1-コストモードdeploymentmode) |
 | `location` | `swedencentral` | デプロイ先リージョン (`eastus` / `swedencentral` / `uksouth`) |
 | `vnetName` | `discovery-vnet` | 仮想ネットワーク名 (2-64 文字) |
-| `storageAccountSku` | `Standard_GRS` | ストレージの冗長性。`Standard_ZRS` / `Standard_GRS` / `Standard_GZRS` / `Standard_RAGRS` / `Standard_RAGZRS` から選択 |
+| `storageAccountSku` | `''` (モード既定) | ストレージの冗長性。`Standard_LRS` / `Standard_ZRS` / `Standard_GRS` / `Standard_GZRS` / `Standard_RAGRS` / `Standard_RAGZRS`。空文字のときはモードの既定値 |
+| `storageAccessTier` | `''` (モード既定) | ストレージのアクセス層 (`Hot` / `Cool`)。空文字のときはモードの既定値 |
+| `nodePoolVmSize` / `nodePoolMaxNodeCount` / `nodePoolMinNodeCount` / `nodePoolScaleSetPriority` / `nodePoolOsDiskSizeGb` | `''` / `-1` (モード既定) | ノードプールの VM サイズ・最大/最小ノード数・優先度・OS ディスクサイズ。空文字または `-1` のときはモードの既定値 |
+| `supercomputerSystemSku` | `''` (モード既定) | スパコンが内部に作る AKS システムノードプールの VM SKU (`Standard_D4s_v4` / `v5` / `v6`) |
 | `chatModelName` / `chatModelDeploymentName` | `gpt-5.4` / `gpt-5-4` | デプロイするチャットモデルとそのリソース名 |
 | `enableGhcpAiFeatures` | `true` | Workspace の `discovery.workbench.enableGhcpAiFeatures` タグ。GitHub Copilot / AI 機能の有効化 |
 | `enableExtensions` | `true` | Workspace の `discovery.workbench.enableExtensions` タグ。VS Code 拡張機能マーケットプレースの有効化 |
@@ -45,6 +49,172 @@ Bicep を使って Microsoft Discovery のインフラ一式を Azure にデプ�
 > ⚠️ **`networkIsolation`**: 既定は `true` ですが、Discovery Studio のワークベンチは現時点で `false` のときのみ接続できます。パブリックプレビューのワークベンチにアクセスしたい場合は `-Parameters networkIsolation=false` を指定してください。
 
 > 📌 **ストレージのネットワーク設定**: `networkAcls.defaultAction` は意図的に `Allow` です。`Microsoft.Discovery` コントロールプレーンが Azure Storage の信頼されたサービスバイパス一覧に未対応で、`Deny` にすると Discovery リソースのプロビジョニングが失敗するためです。デプロイした 5 サブネット (privateEndpointSubnet 以外) の `virtualNetworkRules` は事前設定済みで、Discovery が対応次第 `Deny` に切り替えられます。
+
+---
+
+## 1-1. コストモード（`deploymentMode`）
+
+本テンプレートは **変数 1 つ (`deploymentMode`) を変えるだけ** で、コストに関わるパラメーター群をまとめて切り替えられます。既定は **コスト最適化モード (`CostOptimized`)** です。
+
+| モード | 想定用途 |
+| --- | --- |
+| `CostOptimized` (**既定**) | PoC / 検証 / デモ。使っていない時間帯のランニングコストを最小化 |
+| `Production` | 本番想定。可用性・冗長性・スループットを優先した従来どおりの設定値 |
+
+### モードごとのパラメーターセット
+
+`main.bicep` の `modePresets` 変数が実体です。
+
+| 設定項目 | `CostOptimized` | `Production` | コストへの効き方 |
+| --- | --- | --- | --- |
+| `nodePoolMinNodeCount` (ノードプール最小ノード数) | `0` | `0` | 未使用時はノード 0 台までスケールイン (ゼロスケール) |
+| `nodePoolMaxNodeCount` (最大ノード数) | `1` | `3` | 同時に起動しうる VM 台数の上限 = コスト上限 |
+| `nodePoolScaleSetPriority` (VMSS 優先度) | `Spot` | `Regular` | Spot は従量課金比で最大 8〜9 割引 (退避あり) |
+| `nodePoolOsDiskSizeGb` (OS ディスク) | `64` | `120` | ノード 1 台あたりのマネージドディスク料金を削減 |
+| `nodePoolVmSize` | `Standard_D4s_v6` | `Standard_D4s_v6` | 実処理に必要な最小サイズ。用途に応じて個別上書き可 |
+| `supercomputerSystemSku` (AKS システムノードプール SKU) | `Standard_D4s_v6` | `Standard_D4s_v6` | Discovery が許可する SKU は `Standard_D4s_v4/v5/v6` の 3 つのみ (いずれも 4 vCPU) |
+| `storageAccountSku` (ストレージ冗長性) | `Standard_LRS` | `Standard_GRS` | LRS は GRS の約半額 (地理冗長なし) |
+| `storageAccessTier` (アクセス層) | `Cool` | `Hot` | 保存容量単価が下がる (読み書きトランザクション単価は上がる) |
+
+### モードの切り替え方
+
+```bash
+# コスト最適化モード (既定) — 何も指定しなければこちら
+./deploy.sh
+
+# 本番モードへ切り替え
+DEPLOYMENT_MODE=Production ./deploy.sh
+```
+
+```powershell
+# コスト最適化モード (既定)
+./deploy.ps1
+
+# 本番モードへ切り替え
+./deploy.ps1 -DeploymentMode Production
+```
+
+```bash
+# az CLI を直接使う場合
+az deployment group create -g discoveryRG --template-file main.bicep \
+  --parameters deploymentMode=Production
+```
+
+デプロイ結果には適用されたモードと実効値が出力されます (`deploymentModeApplied` / `effectiveCostSettings`)。
+
+```bash
+az deployment group show -g discoveryRG -n <デプロイ名> \
+  --query "properties.outputs.effectiveCostSettings.value" -o json
+```
+
+### 個別のパラメーター上書き
+
+モードはあくまで既定値の束です。個別のパラメーターを明示的に渡すと、そのパラメーターだけモード値より優先されます (文字列は空文字 `''`、数値は `-1` が「モード既定を使う」の意味)。
+
+```bash
+# コスト最適化モードのまま、ノードプールだけ Regular 優先度に戻す
+az deployment group create -g discoveryRG --template-file main.bicep \
+  --parameters deploymentMode=CostOptimized nodePoolScaleSetPriority=Regular
+```
+
+> ⚠️ `Spot` ノードは Azure 側の都合で **退避 (eviction)** される可能性があります。長時間の計算ジョブを走らせる場合は `nodePoolScaleSetPriority=Regular` を指定するか `Production` モードを使ってください。
+>
+> ⚠️ モードを変えて再デプロイする際、`nodePoolVmSize` / `scaleSetPriority` / `osDiskSizeGb` / `systemSku` / ストレージ冗長性は **作成時のみ指定可能 (immutable)** なプロパティです。既存環境で値を変えたい場合は該当リソース (ノードプール / スパコン / ストレージ) の作り直しが必要です。
+
+### コスト最適化モードで変更される項目 (一覧)
+
+`CostOptimized` を選んだときにどのリソースの何が変わるかの一覧です。**フェーズ 1** は Bicep デプロイ時、**フェーズ 2** はデプロイ後に `optimize-mrg` スクリプトが自動実行します。
+
+#### フェーズ 1: Bicep で制御する (自分のリソースグループ)
+
+| リソース | 変更項目 | `CostOptimized` | `Production` |
+| --- | --- | --- | --- |
+| Node Pool | 最小ノード数 | `0` (ゼロスケール) | `0` |
+| Node Pool | 最大ノード数 | `1` | `3` |
+| Node Pool | VMSS 優先度 | `Spot` | `Regular` |
+| Node Pool | OS ディスク | `64` GB | `120` GB |
+| Node Pool | VM サイズ | `Standard_D4s_v6` | `Standard_D4s_v6` |
+| Supercomputer | システムノードプール SKU | `Standard_D4s_v6` | `Standard_D4s_v6` |
+| ストレージアカウント | 冗長性 | `Standard_LRS` | `Standard_GRS` |
+| ストレージアカウント | アクセス層 | `Cool` | `Hot` |
+
+#### フェーズ 2: デプロイ後スクリプトで制御する (マネージドリソースグループ `mrg-...`)
+
+| リソース | 変更項目 | `CostOptimized` での設定 | `Production` |
+| --- | --- | --- | --- |
+| AKS (スパコン内部) | クラスター SKU tier | `Free` (SLA なし) | 変更しない (`Standard`) |
+| AKS (スパコン内部) | システムノードプール台数 | `1` 台 (下限。0 は不可) | 変更しない |
+| Container Apps | 各アプリのワークロードプロファイル | `Consumption` (従量課金) へ移動 | 変更しない |
+| Container Apps | 各アプリの最小レプリカ数 | `0` (ゼロスケール) | 変更しない |
+| Container Apps | Dedicated (D シリーズ) プロファイル | 未使用になったら削除 | 変更しない |
+| Cosmos DB | スループット種別 | `Autoscale` へ移行 | 変更しない |
+| Cosmos DB | Autoscale 最大 RU/s | `1000` (最小値) | 変更しない |
+| Log Analytics | データ保持期間 | `30` 日 (最短) | 変更しない |
+| Log Analytics | 日次取り込み上限 | `1` GB | 変更しない |
+| ストレージアカウント (MRG 内) | 冗長性 | `Standard_LRS` | 変更しない |
+| ストレージアカウント (MRG 内) | アクセス層 | `Cool` | 変更しない |
+| Azure AI Search | — | **変更しない (Basic 維持)** | 変更しない |
+| Private Endpoint / Private DNS / NSP | — | **変更しない** (削除すると Discovery が壊れるため) | 変更しない |
+| AI Foundry / Azure OpenAI | — | 変更しない (従量課金のためアイドル時の課金なし) | 変更しない |
+
+> ⚠️ **Cosmos DB のサーバーレス化はできません。** `EnableServerless` は**アカウント作成時のみ**指定可能で、既存アカウントへの後付けは Azure の仕様上不可能です (逆方向のみ一方向で移行可)。Discovery が作成した Cosmos DB を作り直すこともできないため、代替として Autoscale 化 + 最大 RU の引き下げを行っています。
+
+> ⚠️ **Private Endpoint は 1 本あたり月数ドルの固定費**が発生し、既定構成では 8 本前後作成されます。これは `networkIsolation=true` の帰結なので、減らしたい場合は `networkIsolation=false` でワークスペースを作り直してください。個別削除は Discovery が動作しなくなります。
+
+### Discovery が自動作成するマネージドリソースについて
+
+Workspace / Supercomputer を作ると、Discovery コントロールプレーンが **管理用リソースグループ (`mrg-dwsp-*` / `mrg-dscmp-*`)** に Azure Container Apps 環境・Cosmos DB・AI Search・AKS クラスター・Log Analytics・ストレージなどを自動生成します。これらは `Microsoft.Discovery` の ARM API (`2026-06-01`) に設定項目が公開されていないため、**Bicep からは SKU やスケール設定を指定できません**。
+
+そのため本リポジトリでは **2 フェーズ方式** を採っています。
+
+1. **Bicep で可能な範囲を最適化** (上表フェーズ 1)
+2. **デプロイ後に `optimize-mrg.sh` / `optimize-mrg.ps1` で MRG 側を最適化** (上表フェーズ 2)
+
+`deploy.sh` / `deploy.ps1` はコスト最適化モードのときに手順 2 を自動実行します。
+
+```bash
+# デプロイ + MRG 最適化 (既定)
+./deploy.sh
+
+# MRG 最適化をスキップしてデプロイだけ行う
+SKIP_MRG_OPTIMIZE=1 ./deploy.sh
+```
+
+```powershell
+./deploy.ps1                     # デプロイ + MRG 最適化 (既定)
+./deploy.ps1 -SkipMrgOptimize    # デプロイのみ
+```
+
+#### `optimize-mrg` スクリプトを単独で実行する
+
+既存環境に対して後から実行することもできます。**既定はドライラン** で、何が変わるかを表示するだけです。
+
+```bash
+./optimize-mrg.sh                          # ドライラン (変更内容の確認のみ)
+./optimize-mrg.sh --apply                  # 実際に適用
+./optimize-mrg.sh --apply --rg discoveryRG # 対象 MRG を Discovery の RG から特定
+```
+
+```powershell
+./optimize-mrg.ps1                                    # ドライラン
+./optimize-mrg.ps1 -Apply                             # 実際に適用
+./optimize-mrg.ps1 -Apply -ResourceGroup discoveryRG  # 対象 MRG を特定
+```
+
+スクリプトの設計方針:
+
+| 方針 | 内容 |
+| --- | --- |
+| **ベストエフォート** | 個々のコマンドが失敗しても**中断せず最後まで全て実行**し、成功した範囲でコストを最適化します。Discovery 側の制約で拒否される操作があるのは想定内です |
+| **冪等** | 現在値を確認し、目標値と異なる場合のみ変更します。何度再実行しても安全です |
+| **ドライラン既定** | `--apply` / `-Apply` を付けたときだけ実際に変更します |
+| **事前チェック** | 拒否割り当て (deny assignment) とリソースロックの有無を確認し、警告を表示します |
+| **サマリー出力** | 最後に 成功 / スキップ / 失敗 の件数と、失敗した項目の一覧を表示します |
+| **破壊的操作なし** | Private Endpoint / Private DNS / NSP には一切触れません |
+
+> 💡 いずれの変更も Discovery のバージョンアップや再プロビジョニングで **元の設定に戻る可能性** があります。スクリプトは冪等なので、定期的に再実行してください。恒久的なコスト削減としては「使わないときは RG ごと削除する」(6. クリーンアップ参照) が最も確実です。
+
+> ⚠️ MRG は Discovery が所有する領域です。手動変更は **Microsoft のサポート対象外** になり得ます。検証環境での自己責任での実施を推奨します。
 
 ---
 
@@ -132,6 +302,8 @@ az account set --subscription "<サブスクリプションID>"
 | `-TemplateFile` / `TEMPLATE_FILE` | `main.bicep` | 使用する Bicep テンプレート |
 | `-WorkspaceAdmins` | `@()` → **サインインユーザーを自動追加** | Discovery Studio (データプレーン) の管理者にする Object ID の配列 |
 | `-WorkspaceAdminType` | `User` | `WorkspaceAdmins` の種別。`User` / `Group` / `ServicePrincipal` |
+| `-DeploymentMode` / `DEPLOYMENT_MODE` | `CostOptimized` | コストモード。`CostOptimized` / `Production` ([1-1. コストモード](#1-1-コストモードdeploymentmode)) |
+| `-SkipMrgOptimize` / `SKIP_MRG_OPTIMIZE=1` | (未指定) | コスト最適化モードでもデプロイ後の MRG 最適化スクリプトを実行しない |
 
 > ✅ **`-WorkspaceAdmins` を省略しても、スクリプトが `az ad signed-in-user show` でサインインユーザーの Object ID を自動取得し、Discovery Platform Administrator ロールを付与します。** デプロイ直後から Discovery Studio で Agent / Project 作成が可能です。
 >
@@ -169,12 +341,12 @@ az provider show --namespace Microsoft.Discovery --query registrationState -o ts
 # リソースグループ作成
 az group create --name discoveryRG --location swedencentral
 
-# デプロイ
+# デプロイ (deploymentMode を省略するとコスト最適化モード)
 az deployment group create \
   --resource-group discoveryRG \
   --name discovery-deploy \
   --template-file main.bicep \
-  --parameters location=swedencentral
+  --parameters location=swedencentral deploymentMode=CostOptimized
 ```
 
 ### デプロイ状況の確認
@@ -318,6 +490,8 @@ az group delete --name discoveryRG --yes --no-wait
 | `subscription-roles.bicep`       | サブスクリプションスコープモジュール (NSP Joiner カスタムロール作成 + Discovery SP へ割り当て) |
 | `deploy.sh`                      | プロバイダー登録〜デプロイを自動化する Bash スクリプト |
 | `deploy.ps1`                     | PowerShell 版デプロイスクリプト (サインインユーザーを Studio 管理者に自動指定) |
+| `optimize-mrg.sh`                | デプロイ後に Discovery のマネージドリソースグループをコスト最適化する Bash スクリプト (ベストエフォート / ドライラン既定) |
+| `optimize-mrg.ps1`               | PowerShell 版 MRG コスト最適化スクリプト |
 | `nsp-perimeter-joiner-role.json` | (参考) NSP 構成用カスタムロール定義 JSON。通常は Bicep が自動作成するので手動使用は不要 |
 | `README.md`                      | 本手順書                                         |
 | `TROUBLESHOOTING.md`             | 追加のトラブルシューティングメモ                 |
