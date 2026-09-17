@@ -54,9 +54,9 @@ Discovery の第1パーティ サービスプリンシパル (Discovery control-
 | `privateEndpointSubnet` | 10.0.4.0/24 | なし | なし | `workspace` (Private Endpoint) |
 | `agentSubnet` | 10.0.5.0/24 | `Microsoft.App/environments` | `Microsoft.Storage` | `workspace` (Agent) |
 | `searchSubnet` | 10.0.6.0/24 | `Microsoft.App/environments` | `Microsoft.Storage` | (予約: Search 用) |
-| `bookshelfSearchSubnet` | 10.0.7.0/24 | なし | `Microsoft.Storage` | `bookshelf` (マネージド AI Search) |
+| `bookshelfSearchSubnet` | 10.0.7.0/24 | `Microsoft.App/environments` | `Microsoft.Storage` | `bookshelf` (マネージド AI Search) |
 
-> ⚠️ `bookshelfSearchSubnet` は **意図的に未委任** です。Bookshelf のマネージド AI Search は `Microsoft.App/environments` に委任されたサブネットに参加できないため、既存の `searchSubnet` とは別に用意しています。また公式仕様上、検索サブネットとプライベートエンドポイントサブネットは別である必要があります。
+> ⚠️ `bookshelfSearchSubnet` は `Microsoft.App/environments` への委任が必要です。また検索サブネットとプライベートエンドポイントサブネットは別である必要があります。
 
 ### コストモード (`deploymentMode`) とタグ
 

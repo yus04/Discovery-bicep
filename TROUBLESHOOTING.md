@@ -80,7 +80,10 @@ Bicep で Microsoft Discovery 基盤を `uksouth` / `discoveryRG` にデプロ�
 ## その他メモ
 
 - **BCP081 警告:** Bicep に Discovery の型定義が無いため出るが**無害**（Preview RP のため）。
-- **`az feature register --name DiscoveryEnabled`:** `FeatureRegistrationUnsupported` エラーが出るが `|| true` で抑制してOK。プロバイダは既に Registered 済み。
+- **`DiscoveryEnabled` の機能登録:** 現行の Discovery RP はこの機能の登録をサポートしないため、スクリプトは `Microsoft.Discovery` プロバイダー登録だけを実行する。
+- **Bookshelf のモデルクォータ不足:** `text-embedding-3-small` / `gpt-5-mini` で `AvailableCapacity: 1000, RequiredCapacity: 2000` が出る場合、この値は **1 単位 = 1,000 TPM** の容量単位。つまり利用可能 1,000,000 TPM に対して 2,000,000 TPM が必要。対象リージョンの **GlobalStandard** クォータ増枠を申請する。`Standard` や他リージョンの空きは流用されない。確認は `az cognitiveservices usage list -l swedencentral`。
+- **Bookshelf の SearchSubnetId:** `bookshelfSearchSubnet` は `Microsoft.App/environments` への委任が必須。検索サブネットとプライベートエンドポイント用サブネットは分ける。
+- **ツールの `infra_node` エラー:** `definitionContent` に `infra[]` を定義し、`actions[]` の各要素に `infra_node` で `infra[].name` を指定する。`actions[]` ごとに必須。
 - **Azure CLI クラッシュ対策:** コマンド前に `export AZURE_CORE_COLLECT_TELEMETRY=0` を付ける。
 - **Preview RP の確認:** Discovery は Preview なので `az rest` で直接 RP API を叩くのが確実。デプロイの spinner を眺めるより `az rest` の status 確認のほうが情報量が多い。
 - **Discovery Studio の中身:** VS Code（VS Code for the Web 系）ベースの UI。
