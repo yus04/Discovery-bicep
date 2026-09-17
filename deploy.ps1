@@ -116,12 +116,11 @@ if ($WorkspaceAdmins.Count -eq 0) {
 }
 
 # ------------------------------------------------------------------
-# 2. リソースプロバイダー & フィーチャー登録
+# 2. リソースプロバイダー登録
 #    ※ Discovery はプレビューのため、登録が完了していないと
 #      "Cannot access Supercomputer" 等のエラーになり得る
 # ------------------------------------------------------------------
 Write-Host '[2/6] Microsoft.Discovery プロバイダーを登録...'
-az feature register --namespace Microsoft.Discovery --name DiscoveryEnabled --only-show-errors *> $null
 az provider register --namespace Microsoft.Discovery --only-show-errors *> $null
 if ($LASTEXITCODE -ne 0) { throw 'プロバイダー登録に失敗しました。' }
 
@@ -166,7 +165,6 @@ Write-Host "      OK: $ResourceGroup ($Location)"
 # 4. Bicep テンプレートの検証
 # ------------------------------------------------------------------
 Write-Host '[4/6] テンプレートを検証 (what-if 省略, validate のみ)...'
-
 # 配列パラメータは JSON リテラル ["id1","id2"] 形式で渡す (PS 5.1 互換)
 # ※ PowerShell → az.exe (Python launcher) はダブルクォートを剥がすため
 #   バックスラッシュエスケープ (\") が必要

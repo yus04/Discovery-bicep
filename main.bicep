@@ -111,9 +111,9 @@ param agentSubnetPrefix string = '10.0.5.0/24'
 @description('Address prefix for Search Subnet.')
 param searchSubnetPrefix string = '10.0.6.0/24'
 
-// The Bookshelf managed AI Search instance needs its own, non-delegated subnet
-// that is distinct from the private endpoint subnet.
-@description('Address prefix for the Bookshelf Search subnet (must differ from the Private Endpoint subnet).')
+// The Bookshelf managed AI Search instance needs its own Microsoft.App-delegated
+// subnet that is distinct from the private endpoint subnet.
+@description('Address prefix for the Bookshelf Search subnet (delegated to Microsoft.App/environments and distinct from the Private Endpoint subnet).')
 param bookshelfSearchSubnetPrefix string = '10.0.7.0/24'
 
 @description('VM SKU for the Node Pool. Leave empty to use the deploymentMode preset (Standard_D4s_v6 in both modes).')
@@ -366,17 +366,45 @@ var effectiveKnowledgeStorageAssetPath = empty(knowledgeStorageAssetPath)
   ? '${knowledgeBlobContainerName}/'
   : knowledgeStorageAssetPath
 
-// Sample tool used when the caller does not supply its own definitions. It runs
-// on the node pool created by this template and writes into the project's
-// storage container, so it works out of the box in both deployment modes.
+// Sample tool used when the caller does not supply its own definitions. Every
+// action must reference an infra node by name through infra_node.
 var defaultTools = [
   {
     name: 'dataset-summary'
     version: '1.0.0'
     definitionContent: {
-      tool_id: 'dataset-summary'
-      name: 'DatasetSummary'
+      name: 'dataset-summary'
       description: 'Summarises tabular datasets (CSV/TSV) that were mounted into the tool container and writes a markdown report.'
+      version: '1.0.0'
+      category: 'general'
+      infra: [
+        {
+          name: 'worker'
+          infra_type: 'container'
+          image: {
+            acr: 'mcr.microsoft.com/azureml/minimal-ubuntu22.04-py39-cpu-inference:latest'
+          }
+          compute: {
+            min_resources: {
+              cpu: '1'
+              ram: '1Gi'
+              storage: '32'
+              gpu: '0'
+            }
+            max_resources: {
+              cpu: '2'
+              ram: '2Gi'
+              storage: '64'
+              gpu: '0'
+            }
+            recommended_sku: [
+              'Standard_D4s_v6'
+            ]
+            pool_type: 'static'
+            pool_size: 1
+          }
+        }
+      ]
       actions: [
         {
           name: 'SummarizeDataset'
@@ -402,20 +430,7 @@ var defaultTools = [
             ]
           }
           command: 'python3 -m discovery_tools.dataset_summary'
-          environment_variables: [
-            {
-              name: 'INPUT_DIRECTORY_PATH'
-              value: '{{ inputPath }}'
-            }
-            {
-              name: 'OUTPUT_DIRECTORY_PATH'
-              value: '{{ outputPath }}'
-            }
-            {
-              name: 'MAX_ROWS'
-              value: '{{ maxRows }}'
-            }
-          ]
+          infra_node: 'worker'
         }
       ]
     }
@@ -563,11 +578,17 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
         }
       }
       {
-        // Left undelegated on purpose: the Bookshelf managed AI Search instance
-        // cannot join a subnet delegated to Microsoft.App/environments.
         name: bookshelfSearchSubnetName
         properties: {
           addressPrefix: bookshelfSearchSubnetPrefix
+          delegations: [
+            {
+              name: 'Microsoft.App.environments'
+              properties: {
+                serviceName: 'Microsoft.App/environments'
+              }
+            }
+          ]
           serviceEndpoints: [
             {
               service: 'Microsoft.Storage'

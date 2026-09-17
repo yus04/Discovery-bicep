@@ -58,12 +58,11 @@ SUB_NAME=$(az account show --query name -o tsv)
 echo "      サブスクリプション: ${SUB_NAME} (${SUB_ID})"
 
 # ------------------------------------------------------------------
-# 2. リソースプロバイダー & フィーチャー登録
+# 2. リソースプロバイダー登録
 #    ※ Discovery はプレビューのため、登録が完了していないと
 #      "Cannot access Supercomputer" 等のエラーになり得る
 # ------------------------------------------------------------------
 echo "[2/6] Microsoft.Discovery プロバイダーを登録..."
-az feature register --namespace Microsoft.Discovery --name DiscoveryEnabled --only-show-errors >/dev/null || true
 az provider register --namespace Microsoft.Discovery --only-show-errors >/dev/null
 
 # 登録完了まで待機 (最大5分)

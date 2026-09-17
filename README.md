@@ -330,9 +330,11 @@ Knowledge Base の Index と検索には、チャットモデルとは別に以�
 
 | モデル | 用途 | Bookshelf 作成時 | Index / 検索時の推奨 |
 | --- | --- | --- | --- |
-| `text-embedding-3-small` | Embedding | 200,000 TPM | 2,000,000 TPM |
+| `text-embedding-3-small` | Embedding | 2,000,000 TPM (容量 2000) | 2,000,000 TPM |
 | `GPT-5.2` | Knowledge Base 検索 | 200,000 TPM | 2,000,000 TPM |
-| `GPT-5-mini` | Knowledge Base 検索 | 200,000 TPM | 10,000,000 TPM |
+| `GPT-5-mini` | Knowledge Base 検索 | 2,000,000 TPM (容量 2000) | 10,000,000 TPM |
+
+> ⚠️ Bookshelf の作成は `text-embedding-3-small` と `gpt-5-mini` の **GlobalStandard クォータ** を検証します。エラーの `AvailableCapacity` / `RequiredCapacity` は **1 単位 = 1,000 TPM** の容量単位なので、`RequiredCapacity: 2000` は **2,000,000 TPM** を意味します。`AvailableCapacity: 1000` (= 1,000,000 TPM) の場合は、対象リージョンの GlobalStandard クォータ増枠を申請してください。増枠までは `SKIP_BOOKSHELF=1 ./deploy.sh` で基盤だけを先行デプロイできます。
 
 > 💡 TPM クォータは Index 完了後に引き下げられます。クォータの確保自体には課金は発生しませんが、他のワークロードを圧迫します。
 
@@ -364,10 +366,10 @@ Discovery Studio の Agent 作成画面にある **Tools** 欄は、ワークス
 | --- | --- | --- |
 | `name` | ✅ | ARM リソース名。`^[a-zA-Z0-9-]{3,24}$` |
 | `version` | ✅ | ツール定義のバージョン文字列 |
-| `definitionContent` | ✅ | `tool_id` / `name` / `description` / `actions[]` を含む JSON |
+| `definitionContent` | ✅ | `name` / `description` / `version` / `category` / `infra[]` / `actions[]` を含む JSON |
 | `environmentVariables` | — | そのツール固有の環境変数 |
 
-`actions[]` の各要素は `name` / `description` / `input_schema` (JSON Schema) / `command` / `environment_variables[]` で構成されます。`{{ 変数名 }}` で `input_schema` の入力値を参照できます。
+`infra[]` は実行ノード (コンテナーイメージとコンピュート要件) を定義します。`actions[]` の各要素は `name` / `description` / `input_schema` / `command` に加えて、実行先ノードを指す **`infra_node` が必須** です。`{{ 変数名 }}` で `input_schema` の入力値を参照できます。
 
 ```bicep
 // 例: パラメーターファイルで自前ツールを渡す
@@ -376,9 +378,37 @@ param tools = [
     name: 'md-simulation'
     version: '1.0.0'
     definitionContent: {
-      tool_id: 'md-simulation'
-      name: 'MolecularDynamics'
+      name: 'md-simulation'
       description: '分子動力学シミュレーションを実行します。'
+      version: '1.0.0'
+      category: 'general'
+      infra: [
+        {
+          name: 'worker'
+          infra_type: 'container'
+          image: {
+            acr: 'mcr.microsoft.com/azureml/minimal-ubuntu22.04-py39-cpu-inference:latest'
+          }
+          compute: {
+            min_resources: {
+              cpu: '1'
+              ram: '2Gi'
+              gpu: '0'
+              storage: '0'
+            }
+            max_resources: {
+            max_resources: {
+              cpu: '2'
+              ram: '2Gi'
+              storage: '64'
+              gpu: '0'
+            }
+            recommended_sku: [ 'Standard_D4s_v6' ]
+            pool_type: 'static'
+            pool_size: 1
+          }
+        }
+      ]
       actions: [
         {
           name: 'RunSimulation'
@@ -390,10 +420,8 @@ param tools = [
             }
             required: [ 'steps' ]
           }
-          command: 'python3 run_md.py'
-          environment_variables: [
-            { name: 'STEPS', value: '{{ steps }}' }
-          ]
+          command: 'python3 run_md.py --steps {{ steps }}'
+          infra_node: 'worker'
         }
       ]
     }
