@@ -576,6 +576,8 @@ az account set --subscription "<サブスクリプションID>"
 | `-SkipBookshelf` | `SKIP_BOOKSHELF=1` | (未指定) | Bookshelf と Knowledge 用ストレージ一式を作成しない ([1-2](#1-2-bookshelf-と-knowledge-base)) |
 | `-SkipTools` | `SKIP_TOOLS=1` | (未指定) | `Microsoft.Discovery/tools` を作成しない ([1-3](#1-3-discovery-ツール)) |
 | `-BookshelfIndexSize` | `BOOKSHELF_INDEX_SIZE` | (モード既定) | Bookshelf の規模。`small` / `medium` / `large` |
+| `-RecreateSupercomputer` | `RECREATE_SUPERCOMPUTER=1` | (未指定) | `Succeeded` でない既存 Supercomputer を削除してから作り直す ([TROUBLESHOOTING ④](TROUBLESHOOTING.md)) |
+| `-SupercomputerName` | `SUPERCOMPUTER_NAME` | `sc-<uniqueString>` | Supercomputer 名を明示指定。壊れた既存リソースを残したまま別名で作り直す用 |
 
 > ✅ **`-WorkspaceAdmins` を省略しても、スクリプトが `az ad signed-in-user show` でサインインユーザーの Object ID を自動取得し、Discovery Platform Administrator ロールを付与します。** デプロイ直後から Discovery Studio で Agent / Project 作成が可能です。
 >

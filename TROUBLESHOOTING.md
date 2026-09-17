@@ -77,6 +77,56 @@ Bicep で Microsoft Discovery 基盤を `uksouth` / `discoveryRG` にデプロ�
 
 ---
 
+## ④ 再デプロイが `Immutable property validation failed: Properties.InternalMetadata.PodCidr` で失敗する
+
+- **症状:** 2 回目以降のデプロイが `DeploymentFailed` → `BadRequest / Resource payload validation failed` で落ちる。
+
+  ```json
+  {"code":"BadRequest","message":"Validation failed for  with message Immutable property validation failed: Properties.InternalMetadata.PodCidr updated from null to \"10.244.0.0/16\""}
+  {"code":"BadRequest","message":"Validation failed for  with message Immutable property validation failed: Properties.InternalMetadata.ServiceCidr updated from null to \"10.30.0.0/16\""}
+  {"code":"BadRequest","message":"Validation failed for  with message Immutable property validation failed: Properties.InternalMetadata.DnsServiceIp updated from null to \"10.30.0.10\""}
+  ```
+
+- **対象リソース:** `Microsoft.Discovery/supercomputers`。
+  `PodCidr` / `ServiceCidr` / `DnsServiceIp` は内部 AKS のネットワーク設定で、
+  [ARM リファレンス](https://learn.microsoft.com/azure/templates/microsoft.discovery/supercomputers)
+  に公開プロパティとして存在しない **RP 内部の `InternalMetadata`**。Bicep からは指定も修正もできない。
+  （`10.244.0.0/16` は AKS 既定の Pod CIDR、`10.30.0.0/16` は VNet `10.0.0.0/16` と重複しないよう RP が選んだ Service CIDR。
+  つまりテンプレートのアドレス設計ミスではない。）
+
+- **原因:** 既存の Supercomputer レコードの `InternalMetadata` が **null のまま登録されている**のに、
+  現在の Discovery RP は PUT のたびにこの値を書き込もうとする。RP 自身がこの 3 項目をイミュータブル扱いしているため
+  `null → 値` の遷移が拒否され、**同名の Supercomputer に対する以降の更新がすべて失敗する**。
+  `InternalMetadata` が null になるのは主に次のケース:
+  1. 初回デプロイが途中で失敗し、Supercomputer が `Failed` / `Canceled` のまま残っている（＝一番多い）
+  2. 古い API バージョン（`2026-02-01-preview` など）で作成され、当時は `InternalMetadata` が記録されていなかった
+
+- **解決:** 更新では直せない。**Supercomputer を削除して作り直す**しかない。
+
+  ```bash
+  # a) スクリプトに任せる (未完了状態の Supercomputer を検出して削除 → 再作成)
+  RECREATE_SUPERCOMPUTER=1 ./deploy.sh
+  # PowerShell: ./deploy.ps1 -RecreateSupercomputer
+
+  # b) 手動で削除 (NodePool / moboBroker も連鎖削除される)
+  az resource delete -g <RG> -n <supercomputerName> \
+    --resource-type Microsoft.Discovery/supercomputers --api-version 2026-06-01
+
+  # c) 既存を残したまま別名で作り直す
+  SUPERCOMPUTER_NAME=sc-retry1 ./deploy.sh
+  # PowerShell: ./deploy.ps1 -SupercomputerName sc-retry1
+  ```
+
+  b) が `Conflict` で失敗する場合は、Workspace が `supercomputerIds` で参照しているので先に Workspace を削除する。
+  それも面倒なら RG ごと消すのが早い（①参照）。
+
+- **予防:** `deploy.sh` / `deploy.ps1` は手順 `[3b/6]` で既存 Supercomputer の `provisioningState` を確認し、
+  `Succeeded` でないものがあればデプロイ前に中止して対処方法を表示する。
+- **補足:** `optimize-mrg.sh --apply` は MRG 内の AKS / Container Apps を直接変更する。Discovery の再プロビジョニングと
+  競合している疑いがあるときは `SKIP_MRG_OPTIMIZE=1 ./deploy.sh` で切り分ける。
+
+---
+
 ## その他メモ
 
 - **BCP081 警告:** Bicep に Discovery の型定義が無いため出るが**無害**（Preview RP のため）。

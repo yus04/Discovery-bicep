@@ -37,6 +37,14 @@
 .EXAMPLE
     ./deploy.ps1 -BookshelfIndexSize medium
     Bookshelf の indexSize をモード既定から明示的に上書き
+
+.EXAMPLE
+    ./deploy.ps1 -RecreateSupercomputer
+    未完了状態 (Succeeded 以外) の Supercomputer を削除してから作り直す
+
+.EXAMPLE
+    ./deploy.ps1 -SupercomputerName sc-retry1
+    既存を残したまま別名の Supercomputer を作成
 #>
 [CmdletBinding()]
 param(
@@ -71,7 +79,16 @@ param(
 
     # 空文字のときは deploymentMode のプリセット (CostOptimized: small / Production: medium)
     [ValidateSet('', 'small', 'medium', 'large')]
-    [string]$BookshelfIndexSize = $(if ($env:BOOKSHELF_INDEX_SIZE) { $env:BOOKSHELF_INDEX_SIZE } else { '' })
+    [string]$BookshelfIndexSize = $(if ($env:BOOKSHELF_INDEX_SIZE) { $env:BOOKSHELF_INDEX_SIZE } else { '' }),
+
+    # 未完了状態の Supercomputer を削除してから作り直す (破壊的操作)
+    [switch]$RecreateSupercomputer,
+
+    # 空文字のときは main.bicep の既定値 (sc-<uniqueString>)
+    [string]$SupercomputerName = $(if ($env:SUPERCOMPUTER_NAME) { $env:SUPERCOMPUTER_NAME } else { '' }),
+
+    # Microsoft.Discovery の API バージョン (main.bicep と揃える)
+    [string]$DiscoveryApiVersion = '2026-06-01'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -162,6 +179,54 @@ if ($LASTEXITCODE -ne 0) { throw "リソースグループの作成に失敗し�
 Write-Host "      OK: $ResourceGroup ($Location)"
 
 # ------------------------------------------------------------------
+# 3b. 既存 Supercomputer の健全性チェック
+#     Microsoft.Discovery/supercomputers は MOBO リソースで、内部 AKS の
+#     PodCidr / ServiceCidr / DnsServiceIp を Properties.InternalMetadata に
+#     イミュータブル値として記録する。作成が途中で失敗した Supercomputer は
+#     この値が null のまま残り、以降の再デプロイが必ず次のエラーになる:
+#       Immutable property validation failed:
+#       Properties.InternalMetadata.PodCidr updated from null to "10.244.0.0/16"
+#     更新では復旧できないため、削除して作り直すしかない。
+# ------------------------------------------------------------------
+Write-Host '[3b/6] 既存 Supercomputer の状態を確認...'
+$existingScs = @(az resource list -g $ResourceGroup `
+    --resource-type 'Microsoft.Discovery/supercomputers' --query '[].name' -o tsv 2>$null)
+$brokenScs = @()
+foreach ($scName in $existingScs) {
+    if (-not $scName) { continue }
+    $scUrl = "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.Discovery/supercomputers/${scName}?api-version=$DiscoveryApiVersion"
+    $scState = az rest --method get --url $scUrl --query 'properties.provisioningState' -o tsv 2>$null
+    if (-not $scState) { $scState = 'Unknown' }
+    Write-Host "      ${scName}: $scState"
+    if ($scState -ne 'Succeeded') { $brokenScs += $scName }
+}
+
+if ($brokenScs.Count -eq 0) {
+    Write-Host '      問題なし'
+} elseif ($RecreateSupercomputer) {
+    foreach ($sc in $brokenScs) {
+        Write-Host "      削除中: $sc (NodePool / moboBroker も連鎖削除されます)"
+        az resource delete -g $ResourceGroup -n $sc `
+            --resource-type 'Microsoft.Discovery/supercomputers' `
+            --api-version $DiscoveryApiVersion -o none
+        if ($LASTEXITCODE -ne 0) {
+            throw "$sc の削除に失敗しました。Workspace が supercomputerIds で参照している場合は先に Workspace を削除してください: az resource delete -g $ResourceGroup -n <workspaceName> --resource-type Microsoft.Discovery/workspaces --api-version $DiscoveryApiVersion"
+        }
+    }
+    Write-Host '      削除完了。デプロイで作り直します。'
+} else {
+    Write-Host ''
+    Write-Host "      ⚠️ Succeeded になっていない Supercomputer を検出: $($brokenScs -join ', ')"
+    Write-Host '         この状態のまま再デプロイすると InternalMetadata のイミュータブル検証で失敗します。'
+    Write-Host ''
+    Write-Host '      対応方法 (いずれか):'
+    Write-Host '        a) 自動で削除して作り直す: ./deploy.ps1 -RecreateSupercomputer'
+    Write-Host "        b) 手動で削除: az resource delete -g $ResourceGroup -n $($brokenScs[0]) --resource-type Microsoft.Discovery/supercomputers --api-version $DiscoveryApiVersion"
+    Write-Host '        c) 別名で作る: ./deploy.ps1 -SupercomputerName sc-retry1'
+    throw '未完了状態の Supercomputer があるためデプロイを中止しました。'
+}
+
+# ------------------------------------------------------------------
 # 4. Bicep テンプレートの検証
 # ------------------------------------------------------------------
 Write-Host '[4/6] テンプレートを検証 (what-if 省略, validate のみ)...'
@@ -186,6 +251,9 @@ $templateParams = @(
 if ($BookshelfIndexSize) {
     $templateParams += "bookshelfIndexSize=$BookshelfIndexSize"
 }
+if ($SupercomputerName) {
+    $templateParams += "supercomputerName=$SupercomputerName"
+}
 
 az deployment group validate `
     --resource-group $ResourceGroup `
@@ -203,14 +271,32 @@ Write-Host '      検証 OK'
 #      権限を持つ必要があります。
 # ------------------------------------------------------------------
 Write-Host '[5/6] デプロイ実行 (スパコン作成に20分以上かかる場合があります)...'
-az deployment group create `
+$deployOutput = az deployment group create `
     --resource-group $ResourceGroup `
     --name $DeploymentName `
     --template-file $TemplateFile `
     --parameters $templateParams `
     --query "{state:properties.provisioningState, ws:properties.outputs.workspaceId.value, mode:properties.outputs.deploymentModeApplied.value, bookshelf:properties.outputs.bookshelfEndpoint.value, tools:properties.outputs.toolNames.value}" `
-    -o json
-if ($LASTEXITCODE -ne 0) { throw 'デプロイに失敗しました。' }
+    -o json 2>&1
+$deployExit = $LASTEXITCODE
+$deployOutput | ForEach-Object { Write-Host $_ }
+
+if ($deployExit -ne 0) {
+    if (($deployOutput -join "`n") -match 'InternalMetadata') {
+        Write-Host ''
+        Write-Host '--------------------------------------------------'
+        Write-Host ' 検出: Supercomputer の InternalMetadata イミュータブル検証エラー'
+        Write-Host '--------------------------------------------------'
+        Write-Host ' 既存の Supercomputer は PodCidr / ServiceCidr / DnsServiceIp が null のまま'
+        Write-Host ' 登録されており、Discovery RP が既定値を書き込もうとして拒否されています。'
+        Write-Host ' この状態は更新では直せません。削除して作り直してください:'
+        Write-Host '   ./deploy.ps1 -RecreateSupercomputer'
+        Write-Host ' 既存を残したい場合は別名で作成してください:'
+        Write-Host '   ./deploy.ps1 -SupercomputerName sc-retry1'
+        Write-Host '--------------------------------------------------'
+    }
+    throw 'デプロイに失敗しました。'
+}
 
 # ------------------------------------------------------------------
 # 6. マネージドリソースグループ (MRG) のコスト最適化
